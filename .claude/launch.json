@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "TAROT API Server",
+      "runtimeExecutable": "/Library/Frameworks/Python.framework/Versions/3.11/bin/uvicorn",
+      "runtimeArgs": ["api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/Volumes/ftproot/TAROT-analyzer/tarot-analyzer/api", "--app-dir", "/Volumes/ftproot/TAROT-analyzer/tarot-analyzer"],
+      "port": 8000
+    },
+    {
+      "name": "TAROT Frontend Dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "/Volumes/ftproot/TAROT-analyzer/tarot-analyzer/frontend"],
+      "port": 3000
+    }
+  ]
+}
