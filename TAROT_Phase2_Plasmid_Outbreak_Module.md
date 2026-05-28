@@ -224,9 +224,23 @@ plasmid_outbreak:
   mash_sketch_size: 10000
   mash_size_correction: true
 
-  # pling
-  pling_containment_threshold: 0.5
-  pling_dcj_threshold: 4
+  # pling (実装済み 2026-05-28: Layer B.1 ③ 高精度クラスタリング層)
+  # リモート WSL2 サーバーで事前に conda 環境構築が必要 (公式手順):
+  #   方法A (bioconda 経由・推奨):
+  #     mamba create -n pling_env -c bioconda -c conda-forge pling
+  #     conda activate pling_env && pling --version
+  #   方法B (ソースから):
+  #     cd ~/program/pling && mamba env create -n pling_env -f env.yaml
+  #     conda activate pling_env && python -m pip install . && pling --version
+  # ソルバーは GLPK (オープンソース) がデフォルト。Gurobi 利用には別途ライセンス必要。
+  pling_enabled: true
+  pling_conda_env: "pling_env"          # mob_suite_env と同パターン (手動構築)
+  pling_threads: 8
+  pling_containment_threshold: 0.5      # sourmash containment 距離閾値
+  pling_dcj_threshold: 4                # DCJ-Indel 距離閾値 (Sheppard et al. 仕様)
+  pling_output_type: "both"             # community + subcommunity 両方出力
+  # 3手法 (mash/mob/pling) のうち何個一致で `confirmed` cluster とするか
+  consensus_min_methods: 2              # 2/3一致=confirmed, 1/3=probable, 0=single
 
   # cgMLST(種別)
   cgmlst_threshold:
@@ -363,7 +377,7 @@ rule ppanggolin_per_cluster:
 |---|---|---|---|
 | 2.0 | 1 か月 | MOB-suite (recon/typer/cluster) + AMRFinderPlus を Snakemake 統合、SQLite スキーマ拡張 | 既存テストデータで MOB-recon の出力が DB に入る |
 | 2.1 | 1 か月 | Mash-based プラスミドアラート(Münster 方式)、chewBBACA cgMLST 統合 | UPMC Presbyterian dataset で再現できる |
-| 2.2 | 1–2 か月 | pling 統合、Cytoscape 出力、Russian Doll dataset で検証 | pling 論文の結果が再現できる |
+| **2.2** ✅ | 1–2 か月 | **pling (containment + DCJ-Indel) 統合、3-method consensus 判定 (mash/mob/pling)**、Cytoscape 出力、Russian Doll dataset で検証 | **実装完了 (2026-05-28): stage2_plasmid_cluster.smk に run_pling/parse_pling_clusters 追加、merge で consensus_level=confirmed/probable 判定、フロント表示 (PlasmidProfileSection / OutbreakAlertsCard) 完了。Russian Doll 検証は次フェーズ** |
 | 2.3 | 1 か月 | PPanggolin / panRGP 統合(プラスミドクラスタごとの pangenome) | persistent/shell/cloud 分類が DB に入る |
 | 2.4 | 1 か月 | HTML report 自動生成(pyGenomeViz, microreact 出力)、Singapore dataset で大規模検証 | 1,000+ プラスミドでスケールする |
 | 2.5 | — | 論文化、TAROT クラウド版への組み込み | — |
