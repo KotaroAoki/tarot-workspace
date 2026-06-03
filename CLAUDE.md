@@ -144,6 +144,16 @@ set -e
 **方針**: VirulenceFinder は菌種ごとに異なる virulence DB を持つ (`stx`, `virulence_ecoli` 等)。`config.virulencefinder.species_db_map` に `species_id → DB リスト` のマップを保持し、Snakemake ルール内の `_resolve_virulencefinder_dbs()` で解決する (AMRFinderPlus の `organism_map` と同パターン)。マップ外の菌種は SKIPPED マーカーを出力。複数 DB は shell ループで順次実行し、パーサが各 DB サブディレクトリの `results_tab.tsv` を統合する。py39 環境で直接実行 (conda 切替不要)。VFDB は ABRicate 経由で別途全菌種実行 (`abricate.databases` に `vfdb` を追加済み)。
 **該当ファイル**: `workflow/rules/stage1_virulencefinder.smk`, `workflow/scripts/parse_virulencefinder.py`, `config/config.yaml` の `virulencefinder` セクション
 
+### 16. 大容量アップロードで「SFTP transfer failed: SSH connection closed」
+**症状**: 8ファイル ~3GB 等の大容量を D&D アップロードすると `SFTP transfer failed: SSH connection closed` (HTTP 502) で失敗。小さいファイルでは成功する。
+**原因**: SSH 接続は **1ログイン = 1本の長命接続を全処理で使い回す** 設計 (`_get_conn`)。`is_closed` チェックは外してあり、接続が死んでも検知・再接続しない。`/api/upload/directory` は (1) 全ファイルを HTTP で `/tmp` にステージング (この間 SSH はアイドル) → (2) `sftp_listdir_recursive` (例外を握り潰す) → (3) 逐次 `sftp_upload`。WSL2 は Hyper-V NAT (vEthernet) 越しで、長いアイドル/大容量転送中に TCP がリセットされやすい。従来の `keepalive_interval=30, count_max=5` (150秒許容) ではステージング中のアイドル切断を救えず、Step3 最初の `sftp_upload` で「接続切れ」が表面化していた。
+**解決**:
+- `_open_connection()` に keepalive を強化 (`interval=15, count_max=4` = 60秒)。
+- `SessionInfo.password` に資格情報をメモリ保持 (ログ・永続化なし、`repr=False`) し、`_reconnect()` で張り直し可能に。
+- `_run_with_retry(token, op)` ヘルパーを追加し、`op(conn)` 実行が接続切断 (`is_closed` or `ChannelOpenError/ConnectionError/OSError/EOFError`) で失敗したら再接続して最大2回リトライ。`sftp.put` は上書きなので冪等 = 途中切断→先頭から再送で安全。
+- `sftp_upload` / `sftp_upload_dir` / `sftp_listdir_recursive` を `_run_with_retry` 経由に変更。`sftp_upload` 内の mkdir は `exec_command` ではなく同一 conn 上の `conn.run()` で実行 (再接続後も正しい conn を使う)。
+**該当ファイル**: `api/services/ssh_manager.py` (`_open_connection`, `_reconnect`, `_run_with_retry`, `sftp_upload`, `sftp_upload_dir`, `sftp_listdir_recursive`)
+
 ## ディレクトリ構造 (主要ファイル)
 ```
 tarot-analyzer/
