@@ -35,7 +35,7 @@ npm run dev
 **解決**: `.bashrc` に頼らず、conda の `profile.d/conda.sh` を直接 source する:
 ```python
 conda_init = (
-    "for p in ~/mambaforge ~/miniforge3 ~/miniconda3 ~/anaconda3 /opt/conda; do "
+    "for p in /opt/mambaforge ~/mambaforge ~/miniforge3 ~/miniconda3 ~/anaconda3 /opt/conda; do "
     'if [ -f "$p/etc/profile.d/conda.sh" ]; then . "$p/etc/profile.d/conda.sh"; break; fi; '
     "done"
 )
@@ -125,7 +125,7 @@ set +e
 (
     set -euo pipefail
     # Snakemake のルール shell は新しい bash プロセスなので conda 関数を再 source
-    for p in ~/mambaforge ~/miniforge3 ~/miniconda3 ~/anaconda3 /opt/conda; do
+    for p in /opt/mambaforge ~/mambaforge ~/miniforge3 ~/miniconda3 ~/anaconda3 /opt/conda; do
         if [ -f "$p/etc/profile.d/conda.sh" ]; then
             . "$p/etc/profile.d/conda.sh"
             break
