@@ -154,6 +154,20 @@ set -e
 - `sftp_upload` / `sftp_upload_dir` / `sftp_listdir_recursive` を `_run_with_retry` 経由に変更。`sftp_upload` 内の mkdir は `exec_command` ではなく同一 conn 上の `conn.run()` で実行 (再接続後も正しい conn を使う)。
 **該当ファイル**: `api/services/ssh_manager.py` (`_open_connection`, `_reconnect`, `_run_with_retry`, `sftp_upload`, `sftp_upload_dir`, `sftp_listdir_recursive`)
 
+### 17. コンティグ (FASTA) ダウンロードとシンボリックリンク切れ
+**背景**: `results/{sample}/input/contigs.fasta` は `validate_fasta` が入力 FASTA へ張る**シンボリックリンク**。NAS へのアーカイブは `cp -a` なのでリンクはリンクのまま複製され、リンク先 (ワーカーの SSD スクラッチ) が撤去された後は **dangling** になる。
+**方針**: ダウンロード API は候補を順に見て最初に読めるものを採用する: `input/contigs.fasta` → `assembly/long_read/contigs.fasta` → `assembly/short_read/contigs.fasta` → `assembly/contigs.fasta`。判定は `[ -r "$p" ] && [ -s "$p" ]` (リンク切れは `-r` が偽になるので自動でスキップされる)。解決は SSH 1コマンドで全サンプル分をまとめて行い、往復を避ける。一括ダウンロードは API プロセス内で ZIP を組み立てる (圧縮は `asyncio.to_thread`、上限 300 サンプル / 2 GB)。
+**該当ファイル**: `api/routers/results.py` (`_CONTIG_CANDIDATES`, `_resolve_contig_paths`, `download_contigs`, `download_contigs_archive`), `frontend/src/lib/api.ts` (`downloadContigsFasta`, `downloadContigsArchive`)
+
+### 18. サンプル ID の「編集」= 表示名エイリアス層 (物理リネームはしない)
+**背景**: サンプル ID は (1) `results/{sample}/` ディレクトリ名、(2) `report/{sample}_report.json` 等のファイル名、(3) 各モジュール JSON の `sample` / `sample_name`、(4) cgSNP DB の `bam_db/{species}/{ST}/{sample}.bam` (系統樹の tip ラベルは **BAM ファイル名の stem**、`run_core_snp_phylo.py`)、(5) plasmid DB の `index.tsv` と `plasmid_uid = {sample}__{cluster}` および `by_cluster/{cid}/{uid}.fasta/.meta.json/.msh`、(6) account DB の `jobs.samples_json`、そして (7) **他サンプルの完成済みレポートに焼き込まれた参照** (cgSNP 距離行列/tree、plasmid の `db_matches` / outbreak alerts) に散らばっている。(7) は物理リネームでは後追い修正できない (その他サンプルを再解析しない限り旧名が残る)。
+**方針**: 内部 ID は**不変**とし、UI と HTML エクスポートに出すラベルだけを差し替えるエイリアス層を持つ。描画時解決なので他サンプル側の参照表示も同時に更新され、可逆で DB 整合性・再解析・冪等性に一切影響しない。
+- 永続化: account DB の `sample_aliases(scope, results_dir, sample, display_name, ...)`。`scope` はテナント分離キーで、アカウントセッションは `group:{group_id}`、レガシー (直接 SSH) は `legacy:{remote_project_root}`。
+- API: `GET /api/results/sample_aliases`、`PUT /api/results/samples/{sample}/display_name` (body `{"display_name": str|null}`、null/空で解除)。`GET /api/results/samples` のレスポンスにも `display_names` を同梱。表示名は他サンプルの表示名/内部 ID と衝突すると 409、`/ \` と制御文字は 400、100 文字上限。
+- フロント: `lib/sampleAlias.ts` がモジュールシングルトン + `useSyncExternalStore`。React 内は `useSampleAliases()`、React 外 (htmlExport) は `displayNameOf()`。**ログアウト時に `resetSampleAliases()`** を呼ぶこと (グループ跨ぎの漏れ防止、`lib/auth.tsx` の `clearSession`)。
+- **内部 ID を使い続ける箇所**: 距離行列のキー、系統樹の leafOrder と `currentSample` 判定、削除/再解析 API の引数、コンティグのダウンロードファイル名、DB ブラウザ (CoreSnpDbBrowser / PlasmidDbBrowser — 実ファイル名を見る画面なので)。表示名を出すのは描画の末端だけに留める。
+**該当ファイル**: `api/services/account_store.py` (`sample_aliases` テーブル + CRUD), `api/routers/results.py` (`_alias_scope`, `_validate_display_name`, 表示名エンドポイント), `frontend/src/lib/sampleAlias.ts`, `frontend/src/components/SampleRenameDialog.tsx`, および表示側 (`pages/Results.tsx`, `pages/SampleDetail.tsx`, `pages/JobDetail.tsx`, `components/CoreSnpSection.tsx`, `components/PhyloTree.tsx`, `components/MstGraph.tsx`, `components/PlasmidDistanceMap.tsx`, `components/PlasmidProfileSection.tsx`, `components/OutbreakAlertsCard.tsx`, `lib/htmlExport.ts`)
+
 ## ディレクトリ構造 (主要ファイル)
 ```
 tarot-analyzer/
