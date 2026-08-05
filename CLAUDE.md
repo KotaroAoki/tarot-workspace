@@ -166,7 +166,113 @@ set -e
 - API: `GET /api/results/sample_aliases`、`PUT /api/results/samples/{sample}/display_name` (body `{"display_name": str|null}`、null/空で解除)。`GET /api/results/samples` のレスポンスにも `display_names` を同梱。表示名は他サンプルの表示名/内部 ID と衝突すると 409、`/ \` と制御文字は 400、100 文字上限。
 - フロント: `lib/sampleAlias.ts` がモジュールシングルトン + `useSyncExternalStore`。React 内は `useSampleAliases()`、React 外 (htmlExport) は `displayNameOf()`。**ログアウト時に `resetSampleAliases()`** を呼ぶこと (グループ跨ぎの漏れ防止、`lib/auth.tsx` の `clearSession`)。
 - **内部 ID を使い続ける箇所**: 距離行列のキー、系統樹の leafOrder と `currentSample` 判定、削除/再解析 API の引数、コンティグのダウンロードファイル名、DB ブラウザ (CoreSnpDbBrowser / PlasmidDbBrowser — 実ファイル名を見る画面なので)。表示名を出すのは描画の末端だけに留める。
+- **エイリアスはジョブ横断で永続する = 同じ内部 ID を再投入すると過去の表示名が復活する。** 実測 (2026-08-03): 7/29 に付けた `22173 → 22173_BSI` 等 10 件が残っていたため、8/3 に `22173/` というフォルダ名でアップロードした新ジョブが JobDetail 上で `22173_BSI` と表示され、「アップロードしたディレクトリ名がサンプル名に採用されない」ように見えた。**DB 上のサンプル名 (`jobs.samples_json`) は投入したフォルダ名どおりで、置き換わっていたのは描画だけ**。原因は JobDetail だけが内部 ID を併記していなかったこと (Results / SampleDetail は併記済み)。**エイリアスを出す画面では必ず内部 ID を併記すること。**
+- **設定時の 409 衝突チェックだけでは足りない。** 「表示名 `22173_BSI`」を付けた後から、内部 ID がそのものずばり `22173_BSI` のサンプルが解析されると一覧に同名行が 2 つ並ぶ。読み出し時にも検査し、**表示名が実在サンプルの内部 ID と一致したエイリアスは自動解除**する (`api/routers/results.py` の `_resolve_aliases`、`GET /api/results/samples` と `GET /api/results/sample_aliases` の両方が経由。解除した内部 ID はレスポンスの `released` に載る)。新しく入ってきた実サンプルの名前を優先し、エイリアス側を内部 ID 表示に戻す方針。
 **該当ファイル**: `api/services/account_store.py` (`sample_aliases` テーブル + CRUD), `api/routers/results.py` (`_alias_scope`, `_validate_display_name`, 表示名エンドポイント), `frontend/src/lib/sampleAlias.ts`, `frontend/src/components/SampleRenameDialog.tsx`, および表示側 (`pages/Results.tsx`, `pages/SampleDetail.tsx`, `pages/JobDetail.tsx`, `components/CoreSnpSection.tsx`, `components/PhyloTree.tsx`, `components/MstGraph.tsx`, `components/PlasmidDistanceMap.tsx`, `components/PlasmidProfileSection.tsx`, `components/OutbreakAlertsCard.tsx`, `lib/htmlExport.ts`)
+
+### 19. contig の molecule 判定 (染色体/プラスミド) は workflow の単一の真実源で行う
+**背景 (事故)**: 判定ルールが frontend の `lib/plasmidMap.ts` と workflow の `select_plasmid_contigs.py` に**手で複製**されていた (両者のコメントに「同じルールに保つこと」と明記してあったが機能しなかった)。旧ルールは 3 条件の OR カスケードで、`circularNonBackbone` と `inCircularMolecule` には backbone ガードがあったのに **`repEvidence` にだけ無かった**。MOB-suite は染色体に `rep_cluster_NNNN` (curated な Inc 型ではなく MOB 内部のクラスタ ID) を高頻度で付けるため、**最大 contig であろうと無条件にプラスミドへ昇格**していた。実測 toho_omori の **9 サンプル中 4 サンプルで染色体まるごと (6.0〜6.8 Mb) が「プラスミド ※再判定」として報告**されており、P. aeruginosa では事実上の常時発火だった。AMR 遺伝子の由来 (染色体性 vs 可動性) が逆に出る重大な誤りで、PlasAnn にも染色体が投入されていた。
+**方針**: 判定は `workflow/scripts/classify_molecules.py` **のみ**が行い `molecule/molecule_classification.json` を出力する。frontend も `select_plasmid_contigs.py` もこれを読むだけ (旧ジョブ用にフォールバックは残すが、そちらにも backbone ガードを入れてある)。判定は OR ではなく **ハードガード + 重み付き証拠スコア + 3 値 (plasmid / chromosome / unclassified)**。
+- **ハードガード** (発火したら証拠によらず確定): `backbone` (最大 contig) / `size_cap` (既定 600 kb 超) / `genome_budget` (昇格すると染色体側が期待ゲノムサイズの 70% を割る)。`size_cap` だけは染色体と断ぜず **`unclassified`** にする (600 kb 超のプラスミドは実在するため)。期待ゲノムサイズは `species_id` → トップレベル `genome_size_map` (アセンブリのダウンサンプリングと同じマップ = 単一の真実源)。
+- **`rep_cluster_NNNN` は uncurated なので単独では不十分** (+1点、確定閾値 3.0)。curated な `IncX3` / `IncP` 等は +2。`circularity_util.split_rep_types()` が両者を分ける。
+- **実測: P. aeruginosa の染色体は `IncP` + `rep_cluster_2238` + `rep_cluster_322` を持つ。** 26410_AB の閉環染色体 (6,838,261 bp / dnaA 起点 / 74×) がこの 3 つに加えて relaxase (MOBH, MOBP)・oriT・完全な MPF 一式 (MPF_F/G/T ×13) を載せていた = **組込み型 ICE**。26411 の 6.02 Mb 染色体も同じ rep_cluster ペアを持つ。低被覆で断片化した 26410 ではこの 1 領域が 3 断片に割れ、別々のメガプラスミド候補に見えていた。**菌種別の除外リストは作らないこと** — IncP-2 メガプラスミドは実在しカルバペネマーゼの主要な運び手なので、IncP を一律に無視すると本物を見逃す。backbone ガード (完全アセンブリ) とスコア閾値 (断片化アセンブリ) で既に正しく処理できている。
+- **`separate_component` (染色体と別の GFA 連結成分 = +2) は環状の contig にしか与えない。** 断片化アセンブリでは全 contig が別成分になるため線状断片に credit を与えると染色体断片が大量に `unclassified` へ流れる (実測 26410 = 被覆 7〜18× の断片化アセンブリで 12 contig 中 11 本が発火し、染色体長が期待値の 0.78 倍まで痩せた)。遊離レプリコンは「閉じた環」であって「繋がらなかった断片」ではない。
+- **反復 contig の高被覆は多コピープラスミドの証拠にしない** (実測 26411 の 40 kb `contig_1` は多重度 2 の反復で 90× = 染色体の 2.1 倍あるがプラスミドではない)。
+**既存サンプルへの遡及**: `workflow/scripts/backfill_molecule_classification.py` (dry-run が既定、`--apply` で書き換え)。circularity.json の v2 再生成 + 判定 JSON 生成 + レポートの該当セクション差し替えを行い、**旧判定との差分だけを表示**する。**`contigs.fasta` と PlasAnn 出力は触らない** (contig 名/座標が既存の MOB/AMRFinder/Bakta 出力とズレて地図が壊れるため)。
+**該当ファイル**: `workflow/scripts/classify_molecules.py` (新規), `workflow/scripts/backfill_molecule_classification.py` (新規), `workflow/scripts/circularity_util.py` (共有ヘルパー追加), `workflow/rules/stage1_mob_suite.smk` (`classify_molecules` ルール), `workflow/scripts/select_plasmid_contigs.py`, `frontend/src/lib/plasmidMap.ts`, `config/config.yaml` の `molecule_classification` セクション
+
+### 20. `assembly_info.txt` の未使用列 (graph_path / alt_group / repeat / mult.) を活用する
+**背景**: `resolve_circularity.py` は `INFO_HEADER` にこれらの列を宣言しておきながら**一度も読んでいなかった**。実測 26411 で必要になった情報は全てここに書いてあった。
+**circularity.json v2 で追加**:
+- **`graph_path` → `edge_map`** = edge ↔ contig の**権威ある対応表**。frontend の `buildSegmentRoles` は従来「長さ + 被覆」で推定マッチングしており、同長のセグメントが複数あると破綻していた (実測 26411: 2 kb 弱の `edge_3` と `edge_4` が両方 `contig_3` に割り当てられ同じ contig が 2 行表示。`edge_4` に対応する contig は実在しない)。`edge_map` があれば推定は一切不要。
+- **`alt_group` → `alt_haplotype`** = Flye 自身が付けた代替ハプロタイプ群 ID。低被覆 (既定: 単コピー基準の 0.35 倍未満) と併せて副アレルと判定し、独立分子として数えない。実測 26411 の `contig_3` (1,509 bp / cov 11 / alt_group=2) が該当。**自前のバブル検出を書くより Flye のラベルの方が確実**。
+- **`repeat` / 反復の冗長度** = 解けなかった反復は、それを挟む全 contig の**両端に重複して出力される**。実測 26411 の 40 kb `edge_1` は FASTA に 5 コピー (contig_1 単体 + contig_2 の両端 + contig_5 の両端) あるがゲノム上は 2 コピーで、**119,562 bp の水増し**。総アセンブリ長・AMR 重複計上・CheckM2 に影響する。**配列は書き換えず集計側でのみ控除する** (`redundancy.deduplicated_length`)。QUAST の Total length が水増し値のままなのは正常。
+- **連結成分 (`components`)** = 遊離プラスミドは独立成分を成す。ただし #19 のとおり**ハード veto ではなく重み付き証拠**として使うこと (IS/Tn が染色体とプラスミドの双方にあると本物のプラスミドまで同じ成分に入る)。
+
+### 21. 多重度 2 の反復による「案 1 / 案 2」の曖昧性はグラフだけでは解けない
+**背景**: 実測 26411 の GFA は edge_1 (40 kb, 多重度 2, cov 90 ≒ 42+49) が edge_2 (5.94 Mb) と edge_5 (513 kb) の**両端に繋がる**構造だった。これは「バブル」(同じ入口・出口を結ぶ 2 本の代替経路) ではなく**反復配列を共有する 2 つの環状経路 = タングル**で、リンクとコピー数の制約を満たす分解が 2 通り存在する:
+- **案 1**: 単一環 `edge_2 → edge_1 → edge_5 → edge_1` = 6.53 Mb の染色体
+- **案 2**: 2 環 `edge_2+edge_1` (5.98 Mb) と `edge_5+edge_1` (553 kb の第二レプリコン)
+
+**オイラー閉路でも一意にならない。** 決着させるには反復長 (40 kb) を跨ぐリードが要る。**アノテーションで確定した (2026-07-31)**: edge_5 (contig_5) に **MLST 座位 `aroE`** とリボソームタンパク質、および内在性オキサシリナーゼ `blaOXA-50` が載っていた。コア・ハウスキーピング遺伝子はプラスミド上に存在しないため **案 1 で確定**。同時に contig_6 (404 kb) は 448 CDS を持ちながら MLST 座位・リボソームタンパク質ともにゼロで、メガプラスミドであることがグラフ/replicon とは独立に裏付けられた。
+**教訓**: グラフのトポロジだけでは解けない曖昧性は、**コア遺伝子の在処**で決着できる。この判定は `classify_molecules.py` の `core_gene` 証拠 (−4) として自動化済み — なお `parse_bakta.py` は名前付き CDS をアルファベット順に 100 件で切っていたため、5,565 CDS ある染色体では "a" 始まりだけで枠を使い切り **MLST 座位 `aroE` が落ちていた**。核心遺伝子は上限とは別枠で必ず残すこと (遺伝子リストは `circularity_util.core_gene_reason` に集約)。**`recA` はリストから意図的に外している** — 一部スキームの MLST 座位だが RecA ファミリーのリコンビナーゼは ICE/プラスミドに普通に載り、実測 26411 では 404 kb のメガプラスミドに `recA` が 1 個あるだけで plasmid → unclassified に退行した。加えて核心遺伝子の重みは**段階化**してある: rRNA あり / リボソーム蛋白 2 個以上 / ハウスキーピング 2 個以上 = −4、単発ヒットは −1.5 (単発では強いプラスミド証拠を覆させない) — Bakta 実行時に rRNA operon (`rrs`/`rrl`/`rrf`) / リボソームタンパク質 (`rps*`/`rpl*`/`rpm*`) / MLST ハウスキーピング遺伝子を載せる contig を染色体側へ強く倒す。**遺伝子名の完全一致で照合すること** — 部分一致にすると `rsmA` ("16S rRNA methyltransferase") のような修飾酵素まで拾ってしまい、あれは CDS でプラスミドにも載りうる。前提として #22 の contig 名復元が済んでいる必要があり、復元されていない Bakta 結果は `core_gene` の材料に使わない (誤った contig を染色体に固定するのは証拠が無いより悪い)。
+**方針**: **配列は結合しない** (`synthesize_circular_contigs.py` を適用しない)。判定を誤ると実在しないキメラ配列が cgSNP 系統樹の BAM と参照配列に入り、後から追跡不能になる。分子単位では 1 つの染色体として扱い、表示は「染色体 6.53 Mb (3 contig・未解決反復 40 kb × 2 コピー)」とする。
+**アセンブリ側の対策**: 40 kb の反復を解くには 40 kb 超のリードが要る。被覆抑制の `seqkit sample -p` は**長さ非依存のランダム抽出**なので (小型プラスミド保護のため意図的にそうしている)、希少な超長鎖リードも同率で捨てていた。**層化抽出** (`stratified_downsampling`, `ultralong_keep_min_len: 30000`) で 30 kb 以上を全件保持し残りだけ間引く。超長鎖だけで目標塩基数の半分を超える場合は自動的に無効化する (実質「長さ順選抜」になり小型プラスミド消失が再発するため)。
+
+### 22. Bakta は contig 名を振り直す — parse_bakta.py で戻す
+**原因**: `bakta` に `--keep-contig-headers` を渡していない。Bakta は INSDC 非準拠のヘッダ (25 文字超、`:` を含む等 — 我々の `contig_2_length:6019678_cov:42_circular` が該当) を入力順に `contig_1..N` へ振り直す。contigs.fasta は `seqkit sort -l -r` で長さ降順なので、**Bakta の番号 = 長さ順位**になる。実測 26411 では Bakta の `contig_1` が 6.02 Mb の染色体 (元の `contig_2`)、`contig_4` が 40 kb の反復 (元の `contig_1`) だった。
+**影響範囲 (実測)**: `bakta_result.json` の `features[].contig` が実体と食い違う。**UI 上の誤表示は起きていなかった** — `per_sample_report._build_bakta_section` が `features` をレポートに載せておらず、feature テーブルは常に空だったため (これ自体が別の取りこぼしで、同時に修正した)。plasmidMap 系は Bakta を参照しないのでプラスミド地図は無事だった。
+**解決**: `parse_bakta.py` が Bakta 自身の出力 (JSON の `sequences`、無ければ `.fna`) と入力 FASTA を**長さで突合**して名前を戻す。**Bakta の再実行は不要**。`--keep-contig-headers` は採らなかった (全サンプル再アノテーションが必要なうえ、非準拠ヘッダを Bakta が受けるか未検証のため)。
+- 突合は **①出現順 + 長さの完全一致 → ②長さの一意一致** の順。どちらも成立しなければ**書き換えない** (推測で誤った名前を付けるより Bakta の名前のまま残す方が安全)。
+- 元の Bakta 名は `features[].bakta_contig` に残す (生の Bakta ファイルを開いたときの照合用)。UI にも併記する。
+- **冪等性に注意。** Bakta 名と元の名前は同じ `contig_N` 名前空間なので、二度当てると復元済みの名前を再度写像して壊れる (実測: 復元後の `contig_2` に再適用すると `contig_5` になる)。**名前の中身では適用済みか判定できない**ため、明示フラグ `contig_names_restored` で守っている。backfill の適用済み判定もこのフラグのみを見ること。
+- 既存サンプルは `workflow/scripts/backfill_bakta_contig_names.py` (dry-run 既定)。`bakta_output/` の Bakta 生成物には触らない。
+**該当ファイル**: `workflow/scripts/parse_bakta.py` (`build_contig_name_map` / `apply_contig_name_map`), `workflow/scripts/backfill_bakta_contig_names.py`, `workflow/rules/stage1_bakta.smk` (parse_bakta に contigs.fasta を input 追加), `workflow/scripts/per_sample_report.py` (`features` をレポートに載せる), `frontend/src/pages/SampleDetail.tsx`
+
+### 23. 実行時間の内訳と高速化 — 律速は CPU コア数ではなく cgSNP
+**実測 (2026-08-03, ONT long-read / kibanb 32コア)**: 1 サンプルのクリティカルパスは約 38 分で、内訳は前処理 2.5 分 → Flye+dnaapler 8 分 → **stage1 全アノテーションモジュール 1.8 分** → core_snp_map 12.8 分 → core_snp_phylo 12.6 分。**cgSNP が約 2/3**。ジョブ全体は `ceil(N/ワーカー数) × 40〜50 分`。ワーカーは honban 64 コア / kibanb・tugrip 各 32 コアで、実行中でも load15 ≈ 5・CPU 95%+ アイドル = **`cores` 既定 48 は律速ではない** (kibanb/tugrip では物理コアを超えているが、需要がそこまで届かない)。アノテーション群の最適化は投資対効果ゼロ。
+**入れた高速化**:
+- **`core_snp.phylo_jobs` (既定 22) と「チャンク数 = 並列数」**: この段が phylo の 9〜10 分を占める。速度を決めるのは**波数 `ceil(チャンク数 / 並列数)`** であって並列数そのものではない。**最初の実装は並列数だけ上げてチャンク数を 22 固定のまま残し、実機で全く効かなかった** — `split_genome_regions` は `chunk_size = total_len // n_chunks` (切り捨て) なので必ず端数が出て 23 チャンクになり、`ceil(23/8)=3` も `ceil(23/11)=3` も同じ 3 波。`-j 22` でも 2 波にしかならない。修正: **chunk_size を切り上げにして (厳密に n 個)、チャンク数を並列数から決める** → 常に 1 波。チャンク境界は出力に影響しない (領域ごとの mpileup を後段で連結するだけ) ことは、実参照 2 種で領域の合計被覆長が実配列長と完全一致 (2,918,010 / 4,689,117) することで確認済み。`--config core_snp_phylo_jobs=N` で上書きでき、1 ワーカー複数サンプル時はオーケストレータが頭割り値を渡す。
+- **`phyml -b 100` → `-b 0`**: phyml の出力から下流が使うのは**樹形と kappa だけ** (支持率は後段の RAxML `-f a -N 1000` が付ける)。ブートストラップは樹形にも kappa にも影響しないので 100 回分は丸ごと捨てていた。
+- **`core_snp.dechat_enabled` は true のまま維持すること (一度 false にして失敗した)**。「アセンブリ側で dechat を外せたなら cgSNP でも外せる」は **誤った類推**。Flye は多数の重なり合うリードから自前でコンセンサスを作るので未補正リードに耐えるが、**cgSNP の wgsim 経路は個々の生リードから擬似リードを作るだけで補正機構が無い**。実測 2026-08-03 (同一サンプル・同一 DB): 補正あり `core=2,650,434 / skipped_het=12,254 / BAM エラー率 0.10〜0.15%` → 補正なし `core=1,522,878 / skipped_het=473,265 / BAM エラー率 1.03〜2.51%`。VarScan が高エラー位置をヘテロ判定してコアから外し、**コアゲノムが参照の 88% → 52% に激減**した。169 秒/サンプルの節約と引き換えにする価値は無い。**コアゲノムは全株の共通部分なので、未補正 BAM が数本混ざるだけで解析全体が引きずられる** (補正済み 16 本の 88% が、未補正 12 本の混入で 52% に低下)。
+- **未着手 (要判断)**: `bwa bwasw` は 202 秒 real / 540 秒 CPU (並列効率 2.7×) で、300 bp の wgsim 擬似リードには `bwa mem` の方が適切。dechat→wgsim→bwasw をやめて minimap2 で直接 BAM 化すれば 12.8 分 → 数分。**どちらも既存 BAM DB が bwasw 由来なので、差し替えるなら同一 species/ST の BAM 再構築と再検証が前提。**
+- **`core_snp_phylo` のサンプル単位実行は意図的にそのまま**。同一 species+ST が同じジョブにあると同じ系統樹を作り直す (実測 Saureus ST8 が 3 サンプル × 12.6 分) が、連続的 cgSNP 監視ではサンプルごとにその時点の系統樹が出ることが要件。(species, ST) 単位の後追い集約にはしないこと。
+
+### 24. ダウンサンプリングは 2 つのバグで完全に無効化されていた (全サンプル 100% のリードが Flye へ)
+**症状**: 全サンプルのログが `downsample=no` かつ `Could not read Total bases, using all reads`。実測 22182 (S. aureus 2.8 Mb) が 384 Mbp = **137×** で Flye に入っていた (設計値 50〜55×)。#21 の層化ダウンサンプリングも `target_depth` も一度も発火していない。**独立した 2 件で、片方だけ直しても効かない。**
+1. **NanoPlot の小数点**: `NanoStats.txt` は `Total bases:  294,624,027.0` と**小数付き**で書く。`stage1_flye_assembly.smk` の抽出はカンマ/空白しか除去しないため `.` が残り、直後の `case ''|*[!0-9]*) TOTAL_BASES=0` に落ちて「不明 = 全リード使用」になる。→ `perl` 側で `s/\..*$//` を追加。
+2. **`snakemake` グローバルによる import 失敗**: `run_mash_screen.py` は末尾で**無条件に `main()` を呼んでいた**ため、`estimate_genome_size.py` の `from run_mash_screen import load_accession_map` が `NameError: name 'snakemake' is not defined` で失敗。except で握り潰されて `acc_map` が常に空になり、`_resolve_organism` が mash screen の comment 末尾にある **`[...]` (mash 自身の省略記号)** を菌種名として拾って**種名が文字列 `"..."`** になっていた。→ `if "snakemake" in globals(): main()` でガード、`_resolve_organism` は「属+種」らしいブラケットだけ採用、ローカル CSV ローダのフォールバックと空ロード時の WARNING も追加。
+**教訓**: Snakemake の `script:` 用スクリプトは**必ずガード付きで `main()` を呼ぶ**こと。ガードが無いと他スクリプトから import した瞬間に落ち、`except Exception` で握り潰されて**静かに機能が消える**。
+
+### 25. 1 ワーカー複数サンプル (samples_per_worker) — 分離すべきは「作業ディレクトリ」
+**背景**: Snakemake のロックは**作業ディレクトリ単位**なので、共有 root で 2 本起動すると後発が LockException で即死する。これが `samples_per_worker=1` 固定だった理由。
+**方針**: サンプル専用 workdir `{root}/orch_work/{job_id}/{sample}` で snakemake を起動し、`input_dir` / `results_dir` / `log_dir` を**絶対パスで渡して出力先は従来と同じ場所に保つ** (`{root}/{output_dir}` を前提にした監視・アーカイブ・`.status`/`.stream` の処理を一切変えない)。`samples_per_worker<=1` のときは workdir=root のままなので**従来と完全に同一のコマンドになる** (レガシーのバッチ経路と on-demand Core SNP も `single_sample=False` なので無変更)。
+- `--cores` は同時サンプル数で頭割り (48 → 2 並列で 24)。`core_snp_phylo_jobs` も同様に頭割りして渡す (GNU parallel は snakemake の `--cores` 会計の外で走るため、放置するとワーカーのコア数を超える)。
+- `_unlock_remote(workdir=...)` を**必ずサンプルの workdir に向ける**こと。共有 root を解錠すると同一ワーカーで走行中の別サンプルのロックを剥がす。
+- **`account_worker_cap` はサンプル数ではなく「占有ワーカー台数」で判定すること** (実機で踏んだ)。既定 3 を実行中サンプル数と比べていたため、samples_per_worker=2 にしても **3 サンプルで頭打ち = 1 ワーカー 1 サンプルに逆戻り**した。samples_per_worker=1 の間は「サンプル数 = 占有台数」で一致していたので誰も気づかない。加えて **cap 到達後も既に占有しているワーカーの空き枠には積めるようにする**こと (cap=ワーカー台数の現構成では、全台を掴んだ瞬間にディスパッチが止まり 2 枠目が永久に埋まらない)。
+- ディスパッチは `avail[0]` ではなく**最少負荷ワーカー**を選ぶ (先頭固定だと 1 台目を定員まで埋めてから 2 台目に移る)。
+- `_sync_pipeline_files` はワーカー単位の asyncio ロックで直列化 (走行中の別サンプルが読んでいる workflow/ への同時展開を避ける)。
+- 副次効果: `fastplong.html` / `reads_k21_s1.h5` のような**cwd に書かれる副産物**がサンプル別に分離される (従来は共有 root で衝突していた)。
+- 残存リスク: PlasAnn の DB 自動ダウンロードはロックが無いため、**DB 未整備のワーカー**で 2 サンプルが同時に初回起動すると競合しうる (整備済みワーカーでは無害)。
+- **並列度を上げると既存の read/write 競合が顕在化する。** 実機 1 本目で `bam_db/{species}/{ST}/metadata.json` の JSONDecodeError が出た (22173_BSI の phylo が失敗。BAM 自体は登録済み)。`store_bam_to_db` が `open(path,"w")` で直接上書きしており、truncate から書き終わりまでの間に読んだ側が途中の JSON を見ていた。`fcntl.flock` は **writer 同士しか**守っておらず reader (`collect_bams`) はロックを取らない。→ **一時ファイル + `os.replace` のアトミック置換**に変更し、reader 側にも再試行を追加。3 秒間の並行読み書き再現で旧 14,139 件 → 新 0 件。**NAS 上の共有 JSON を書く箇所は全て同じ形にすること。**
+**該当ファイル**: `api/services/snakemake_runner.py` (`_sample_workdir`, `_build_remote_command(workdir=)`, `_unlock_remote(workdir=)`, `_try_dispatch`, `_sync_pipeline_files`), 環境変数 `TAROT_SAMPLES_PER_WORKER` (既定 2)
+
+### 26. cgSNP は NAS 帯域が天井 — 超えると**沈黙して壊れた系統樹を出す**
+**実測 (2026-08-03, samples_per_worker=3 = 9 サンプル並走)**: 9 検体中 **6 検体のコアゲノムが 0.1〜5.7%** に激減した状態で `status=completed` の系統樹・距離行列が出力された。正常値は 52〜81%。ログには `samtools mpileup: error reading from input file` が全チャンク分出ていた。
+**原因**: 9 サンプル × `parallel -j 7` = 最大 63 本の同時読み出しが QNAP に集中。`/mnt/nas/tarot` は **CIFS の `soft` マウント**なのでブロックせず **I/O エラーを返す** → samtools がチャンクを放棄 → 空のまま集計。`run_core_snp_phylo.py` は空チャンク数を**表示するだけ**で、異常を検知せず completed を書いていた。**距離が実際より近く出る方向に壊れる**ため偽のアウトブレイクを示唆しかねない。
+**NAS の実測帯域**: 単一ストリーム 96 MB/s、3 ワーカー同時で各 44〜54 MB/s (集約 約 150 MB/s)。**ワーカー 3 台が読むだけで飽和**する。phylo 1 回あたりの読み出しは「同一 species+ST の全 BAM」= Saureus ST8 で 28 BAM / 2.2 GB あり、**検体が増えるほど増える**。
+**入れた検知 (3 段)**: ① samtools の stderr も `varscan_stderr.log` へ落とし `error reading from input file` / `[E::` / `truncated` を走査 ② 空チャンクが 1 つでもあれば失敗 ③ **コアゲノム率 < `core_snp.min_core_fraction` (既定 0.3) なら系統樹を出さず `status=failed`**。閾値の根拠は実測分布 (壊れた側 ≤5.7% / 正常側 ≥52%)。**正常値は株数が増えるほど下がる** (22 株 81% → 28 株 52%) ので、上げすぎると DB 成長で正常検体を誤検知する。
+**運用**: `samples_per_worker` は **キャッシュ導入前は 2 が上限**。3 は CPU・メモリではなく NAS で破綻する。
+**恒久対策 = BAM のワーカー SSD キャッシュ (`localize_bams`)**: phylo が読む「同一 species+ST の全 BAM + .bai」だけを `{remote_project_root}/bam_cache/{species}/{ST}/` に複製して、そちらを読む。
+- **有効性は「サイズ + mtime 一致」で判定する。BAM は不変ではない** — 同じサンプルを再解析すると `{sample}.bam` が上書きされるので、存在チェックだけでは古い BAM を使い続ける。許容は **1 秒未満**: コピー先 (drvfs 等) の mtime 秒切り捨ては 1 秒未満に収まるので吸収でき、上書きはそれより大きくずれるので検出できる。**2 秒にすると同サイズの書き換えを取りこぼす** (検証で実証)。
+- **`metadata.json` はキャッシュしない** (可変。常に NAS から読む)。
+- 上限 `core_snp.bam_cache_max_gb` (既定 50) 超過で古い ST ディレクトリから削除。**使用中の ST は必ず残す**。
+- 同一ワーカーで複数サンプルが同じ ST を同時に取りに来るので、ST 単位の flock + 一時ファイル + `os.replace` で直列化・原子化する。
+- **失敗しても解析を止めない** (NAS の元パスにフォールバック)。キャッシュはあくまで高速化。
+- 置き場所を `results_dir` 配下にしないこと (ジョブ完了時に消えて再利用できない)。
+**該当ファイル**: `workflow/scripts/run_core_snp_phylo.py` (`CoreSnpQualityError`, `scan_mpileup_errors`, `reference_length`, `localize_bams`, `_cache_is_valid`, `_prune_bam_cache`), `workflow/rules/stage2_core_snp.smk`, `config/config.yaml` の `core_snp.min_core_fraction` / `bam_cache_*`
+**罠**: Snakemake の `shell:` ブロックは**コメント行も format される**ため、コメント中に `{...}` を書くと `NameError: The name '...' is unknown in this context` でルールが死ぬ。
+
+### 27. NanoPlot が Kaleido (ヘッドレスブラウザ) でハングし、サンプルが無限に止まる
+**実測 (2026-08-03)**: 22188_BSI が `preprocessing` フェーズで **57 分間** 0% CPU のまま停止。`NanoPlot` プロセスと `choreographer/cli/browser_ex...` (Kaleido が起動する headless Chrome) が 10 個以上生き残っていた。NanoStats.txt と一部の PNG までは書けており、次の PNG エクスポートで固まっていた。
+**性質**: flye ルールは `|| echo "NanoPlot failed, continuing"` で**失敗には耐えるがハングには耐えない** (NanoPlot にタイムアウトが無い)。ハートビートは動き続けるので API からは「処理中」に見え、ジョブが永久に終わらない。
+**復旧**: `NanoPlot` の PID と `pkill -f "site-packages/choreographer"` を kill すれば `||` の分岐に落ちてそのまま先へ進む。**NanoStats.txt は先に書かれているのでダウンサンプリングは正常に働く** (kill しても被害なし)。
+**恒久対策 (未実装)**: flye ルールの NanoPlot 呼び出しを `timeout` で包む。Bandage の `QT_QPA_PLATFORM=offscreen` と同種の「ヘッドレス環境に GUI 依存が紛れ込む」問題。
+
+### 28. モジュールの「無出力」を陰性として通してはいけない — PlasmidFinder が 26/90 検体で偽陰性
+**症状 (2026-08-05)**: 90 検体中 **26 検体**で PlasmidFinder が「レプリコン 0 件 / `status=PASS`」を返していたが、再実行すると**全 26 検体がレプリコンを保有**していた (0 件 → 1〜10 件)。「プラスミドが無い」ではなく「**検査できていない**」状態。裏付けとして 17559 は PlasmidFinder 0 件なのに、同じアセンブリに対し MOB-suite は閉環プラスミド 7 個を検出し `IncL/M` (76.7 kb)・`IncFIB`/`IncFII` (236.8 kb)・`ColRNAI` をタイピングしていた。
+**原因は 3 段重ねで、1 つ直しても表面化しない**:
+1. **Docker イメージ `plasmidfinder:latest` が honban にだけ無い** (kibanb・tugrip にはある)。**Docker Hub に存在しないローカルビルド専用イメージ**なので `docker run` が `pull access denied` で落ちる。**honban に割り当てられた検体だけが影響を受けるため、ワーカー割当次第で成否が変わり再現性が無いように見える**。DB パス (`/mnt/nas/tarot/program/plasmidfinder/plasmidfinder_db`) は NAS 共有なので 3 台とも正常。
+2. ルールが `docker run ... | tee -a {log} || true` で**終了コードを捨てていた**。ログには `[plasmidfinder] Completed` と出る。
+3. `parse_plasmidfinder.py` が**無条件に `status="PASS"`** を書き、出力ファイル不在をそのまま陰性として扱っていた。
+**解決**: ルールは `PIPESTATUS` で docker の終了コードを見て、失敗時 (または出力が空のとき) に `PLASMIDFINDER_ERROR` マーカーを書く。**ルール自体は exit 0 のままにして下流を巻き込まない** (#cefiderocolFinder のハードフェイルでサンプル全損した件と同じ方針)。パーサは `build_result(outdir)` という純粋関数に切り出し (Snakemake と backfill の単一の真実源)、出力が 1 つも無ければ `status="FAIL"` を書く。既存検体は `workflow/scripts/backfill_plasmidfinder.py` (dry-run 既定)。
+**教訓 (他モジュールにも効く)**:
+- **`|| true` で外部ツールを握り潰しているルールは同じ偽陰性を抱えている。** 判定は必ず**出力ファイルの実在**で行うこと — **exit 0 でも空のことがある**ので終了コードだけでは足りない。
+- **ワーカー間の Docker イメージ差分を疑うこと。** DB は NAS 共有で揃うが**イメージはローカル**。復旧は kibanb で `docker save` → NAS → honban で `docker load` (771 MB, 各 15 秒)。
+- **再解析は古いモジュール出力を消さない。** 実測 17559_BSI: 再解析で `plasmidfinder_result.json` は 0 件に上書きされたのに `plasmidfinder_output/` には旧実行 (6/16) のファイルが残り、**JSON と出力が矛盾**した。しかも残った TSV の contig 名は**旧アセンブリのもの**で座標が現物と合わない。「出力があるか」だけで backfill 対象を選ぶと取りこぼす。
+- **backfill でレポートを直すとき `backfill_sample_reports.py --force` を使わないこと。** あれはレポート全体を作り直すので、そちらが組み立てない `paidb` / `molecule_classification` / `assembly_circularity` / `vector_screen` / `bakta` / `plasann` が消える。**該当セクションだけ差し替える** (`backfill_plasmidfinder.patch_report` がその形)。
+- パーサの `main()` は #24 のとおり `if "snakemake" in globals():` でガードすること (backfill から import するため)。
+**該当ファイル**: `workflow/rules/stage1_plasmidfinder.smk`, `workflow/scripts/parse_plasmidfinder.py` (`build_result`), `workflow/scripts/backfill_plasmidfinder.py` (新規)
 
 ## ディレクトリ構造 (主要ファイル)
 ```
