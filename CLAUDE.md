@@ -274,6 +274,182 @@ set -e
 - パーサの `main()` は #24 のとおり `if "snakemake" in globals():` でガードすること (backfill から import するため)。
 **該当ファイル**: `workflow/rules/stage1_plasmidfinder.smk`, `workflow/scripts/parse_plasmidfinder.py` (`build_result`), `workflow/scripts/backfill_plasmidfinder.py` (新規)
 
+### 28.1 全モジュールの「無言の偽陰性」監査結果 (2026-08-05)
+#28 を受けて全 26 ルール + 20 パーサを監査した。**判定基準は「外部ツールが落ちたとき、
+パーサが 0 件 = 陰性として PASS を書いてしまうか」**の一点。
+
+**露出していた 5 モジュール (いずれも修正済み)**:
+| モジュール | 握り潰し方 | 修正 |
+|---|---|---|
+| **AMRFinderPlus** | `EXIT` を記録するだけで判定に使わず、**失敗時にヘッダのみの TSV を自分で書いていた**ためパーサが正常に読めてしまう | `HAVE_OUT` をヘッダ補完の**前**に評価し `AMRFINDER_ERROR` を書く |
+| **ResFinder** | `\|\| true` | `PIPESTATUS` + 出力実在 → `RESFINDER_ERROR` |
+| **PAIDB** | `\|\| true` (blastn) | 終了コード → `PAIDB_ERROR` |
+| **VirulenceFinder** | DB ごとに `\|\| true` | DB ごとに判定 → `VIRULENCEFINDER_ERROR` |
+| **ABRicate** | パーサが `except Exception: pass` で読み取り失敗を捨てていた | DB ごとに TSV の実在/サイズを見て `failed_databases` を出す |
+
+**AMRFinderPlus が最重要**。全検体に走る NCBI 公式 AMR バリデーション層で、
+かつ**「ヘッダのみ TSV を書いて下流を守る」という善意の作りが、そのまま
+検査不能を陰性に見せる経路になっていた**。ツールは検出 0 件でもヘッダを書くので、
+出力を見ても区別が付かない — **終了コードだけが唯一の根拠**。
+
+**露出していなかったモジュール**とその理由 (パーサが出力実在で FAIL を出せる):
+kaptive / cgMLST / SeqSero2 / MOB-suite / MEFinder / CheckM2 / fimtyper /
+ShigaPass / SerotypeFinder / cefiderocolFinder / PlasAnn / PlasmidFinder。
+`set +e` + `EXIT` 未使用のルールでも、パーサ側が守っていれば偽陰性にはならない。
+**ルール単体を見て「危険」と判断しないこと — 判定はルールとパーサの対で行う。**
+
+**実データでの影響 (NAS 全 257 検体)**: AMRFinder のヘッダのみ TSV が 4 件
+(`yamaguchi` の Streptococcus)。ResFinder / ABRicate / VirulenceFinder / PAIDB は 0 件。
+PlasmidFinder のような大規模な取りこぼしは**今回は無かった**が、
+**4 件は「陰性」と「実行不能」が原理的に区別できない状態だった** (ログが既に消えており事後判定不能)。
+検出スクリプトは `workflow/scripts/audit_silent_failures.py`。
+
+**残った構造的な穴**: パーサ 20 個中 18 個が `main()` を無条件に呼んでいる (#24 のバグ型)。
+今回触れた 4 個 (`parse_amrfinder` / `parse_resfinder` / `parse_abricate` +
+既存の `parse_plasmidfinder` / `parse_bakta`) はガード済み。**backfill を書くときは
+対象パーサのガードを先に入れること。**
+
+### 29. cgSNP のスキーム解決は「属内に複数スキームがある属」で丸ごと落ちる
+**症状 (実測 2026-08-05)**: `Klebsiella variicola` / `quasipneumoniae` / `grimontii` /
+`michiganensis` / `aerogenes` の **19 検体**が
+`no cgSNP scheme for species '...'` で cgSNP を一切取れていなかった。
+菌種同定も MLST も正常 (`mlst` は `klebsiella` / `koxytoca` / `kaerogenes` スキームで
+ST1423・ST216 等を正しく返していた) のに、cgSNP だけが落ちる。
+
+**原因**: `resolve_target_scheme()` は `stringmlst_species_map` のキー (`属_種` 形式) を
+**属名でマッチし、候補が複数あるときだけ種小名一致を要求する**。
+Enterobacter は属内にスキームが 1 つ (`Enterobacter_cloacae`) しかないので
+E. hormaechei も自動的に拾えていた。ところが **Klebsiella は属内に 3 つ**
+(`Klebsiella_pneumoniae` / `_oxytoca` / `_aerogenes`) あるため種小名一致が必須になり、
+**スキーム名になっていない近縁種が全部 (None, None) に落ちる**。
+Enterobacter で動いていたので誰も気づかなかった。
+
+**解決**: `config.core_snp.species_scheme_map` に
+`菌種名 → {stringmlst_db, species_dir}` を明示する層を追加し、genus 推定より優先させる。
+`subsp.` 付きの菌種名も前方一致で拾う。
+
+**重要な設計判断 — ST 体系は共有するが参照ゲノムは種ごとに分ける**:
+- K. pneumoniae complex (pneumoniae / variicola / quasipneumoniae / quasivariicola /
+  africana) は PubMLST の **klebsiella スキームを共有**するので `stringmlst_db` は共通。
+- しかし **`species_dir` は種ごとに分ける** (`Kvariicola` / `Kquasipneumoniae` …)。
+  K. pneumoniae と K. variicola の **ANI は約 95%** で、参照を共有するとマッピング率が
+  落ちてコアゲノムが痩せる (#26 の `min_core_fraction` に引っかかる)。
+  加えて **ST 番号が同じでも別種なら別クラスタ**なので BAM DB も分離が要る。
+  実際 ST1423 は K. variicola の系統で、K. pneumoniae 3,154 株の型別け表に 1 件も無い。
+- したがって `Kvariicola/representative_genomes/ST1423/` のように**種別のディレクトリを
+  新設**する。旧実行が `no reference genome for Kpneumoniae ST1423` を出していても、
+  **そこを埋めてはいけない** (別種の参照を当ててしまう)。
+
+**Klebsiella だけの話ではない — 一般則**: 属内にスキームが**1 つしか無い**属では
+genus マッチが常に成立するので、**その属のあらゆる種がそのスキームの species_dir に
+吸い寄せられる**。Klebsiella (スキーム 3 つ) では「解決できずに落ちる」形で露見したが、
+**スキームが 1 つの属では落ちずに「遠い参照へ静かに当たる」形になる**ので質が悪い。
+実測 2026-08-05: `Citrobacter farmeri` の 17580 / 17580_BSI が `Cfreundii` の参照に
+割り当てられていた (**ANI 約 88〜91%**)。ST 体系の共有自体は正しく mlst も cfreundii
+ST1200 を返すが、参照ゲノムとしては遠すぎてコアゲノムが痩せ、
+**距離が実際より近く出る方向に壊れる** (#26 と同じ壊れ方)。
+`Cfarmeri` / `Camalonaticus` / `Ckoseri` を種別ディレクトリに分けた。
+**参照が未整備なら "no reference genome" で止まるが、遠い参照に当てて痩せたコアゲノムを
+黙って出すより止まる方が良い。**
+点検は `workflow/scripts/audit_species_dir_mismatch.py`
+(「species_id の菌種」と「species_dir が想定する菌種」を突き合わせ、
+既知の複合種 — Enterobacter cloacae complex, Campylobacter jejuni/coli — は除外する)。
+**新しい菌種が同定されたら走らせること。**
+
+**再解析で自然に直るもの**: 実測で `Enterobacter hormaechei` の 17948_BSI が
+`Salmonella` の参照を要求していた ([[project_cgsnp_stringmlst_species_misassign]] の
+交差反応バグの残骸)。修正済みなので**再解析すれば species_id 経由で Ecloacae に
+解決される**。古い `mapping_info.json` の内容を「現在の挙動」と読み違えないこと。
+
+**該当ファイル**: `workflow/scripts/run_core_snp_map.py` (`resolve_species_override`,
+`resolve_target_scheme`), `workflow/rules/stage2_core_snp.smk`,
+`config/config.yaml` の `core_snp.species_scheme_map`,
+`tools/backfill_missing_references.py` の `SPECIES_CONFIG`,
+`workflow/scripts/audit_species_dir_mismatch.py`
+
+### 29.1 参照ゲノム補充ツールの落とし穴
+`tools/backfill_missing_references.py` を実際に回して踏んだもの。
+
+- **`mlst --scheme` に渡す名前が実在しないと、黙って「該当 ST 無し」になる。**
+  `SPECIES_CONFIG` の 7 件が実在しない名前だった:
+  `kpneumoniae`→**`klebsiella`**, `senterica`→**`senterica_achtman_2`**,
+  `smarcescens`→**`serratia`**, `pmirabilis`→**`proteus`**,
+  `lmonocytogenes`→**`listeria_2`**, `abaumannii`→`abaumannii_2`,
+  `ecoli`→`ecoli_achtman_4`。数百ゲノム落として型別けし、
+  何も見つからずに終わるので**失敗が成功と同じ見た目になる**。
+  起動時に `mlst --list` と突き合わせて落とすようにした。
+- **PATH に他 conda env の bin を足さないこと。** bwa を使いたくて
+  `PATH=/opt/mambaforge/envs/core_snp_env/bin:$PATH` としたら、
+  core_snp_env の **Perl 5.22 が py39 の 5.32 を隠して** `mlst` が
+  `Perl v5.32.0 required` で即死した。`--bwa-bin` で実体を直接指す。
+- **`datasets` CLI は 3 ワーカーのどこにも入っていない。** py39 は壊すと影響が
+  大きい共有環境なので (memory: py39 環境全損の件)、**NCBI Datasets の REST API を
+  `urllib` で直接叩く経路**を実装した。追加インストール不要。
+  メタデータは `/genome/taxon/{taxon}/dataset_report`、本体は
+  `/genome/accession/{acc}/download` (ZIP)。
+- **既存の `{ref_dir}/{species}/mlst_results.tsv` を先に引くこと。** 初回構築時の
+  型別け結果が残っており (Kpneumoniae は 3,154 件)、目的の ST があれば
+  **1 ゲノム落とすだけで済む**。ただし**表の ST を鵜呑みにせず mlst で再確認する**
+  (スキーム更新で番号が変わりうる)。
+- **「N ゲノム走査しても見つからない」ときは、まず `taxon` / `extra_taxa` の
+  指定漏れを疑うこと。** 実測 2026-08-05: `Ecloacae ST252` が
+  **733 ゲノムを全走査しても見つからなかった**が、真因は探索対象が
+  `cloacae` + `hormaechei` + `kobei` の 3 種だけだったこと。
+  検体 17556 は **E. asburiae**、17561 は **E. ludwigii** で、
+  **そもそも当該菌種のゲノムを 1 件も見ていなかった**。
+  対象外の ECC メンバーに complete ゲノムが 275 件あり、
+  asburiae を足したら ST252 が即座に見つかった
+  (置かれた参照は `Enterobacter asburiae strain 5549 chromosome, complete genome`)。
+  **走査数の多さは網羅性の証拠にならない。**
+- **ST=any (STany) で種レベル参照を置ける。** `find_reference()` は ST 固有参照が
+  無いとき **STany に自動フォールバックする**ので、目的の ST の公開ゲノムが
+  存在しない菌種はここを埋めれば cgSNP が動く (**2 株以上で距離行列は出る**。
+  系統樹は `min_strains` 以上必要)。`--target {species}:any` で配置でき、
+  品質順ソートの先頭が選ばれる (実測 Cfarmeri は 1 contig 4.92 Mb が採用された)。
+  **同種であることだけが担保で ST は揃わない**ため、複数 ST が同じ木に混ざる点は
+  解釈時に留意すること。
+- **配置時に `bwa index` を張っておくこと。** `run_core_snp_map.py` は索引が
+  無ければ実行時に張るが、同じ ST を複数サンプルが同時に使うと並行生成になる。
+
+### 30. 小型プラスミドは 2026-07-27 以前のアセンブリでは系統的に失われている
+**発端**: 16656 で「短い環状 contig が大量に (8 本) 出ている」ことをアセンブリ異常と疑った。
+**結論: 異常ではなく実在の小型 Col プラスミドで、むしろ旧版が取りこぼしていた方が問題。**
+
+**16656 の検証 (根拠を 4 つ揃えた)**:
+1. **同一分離株の別ライブラリ (16656_BSI, 6/16 解析) のアセンブリには 1 本も無い**
+   (13 contig 中 7 本が 0% 一致) が、**その BSI 側の生リードには大量に在る**。
+   30-mer シードで数えると、染色体が 23 hits/seed に対し小型 contig は
+   1,700〜3,000 hits/seed = **染色体の 70〜130 倍**。つまり
+   「無かった」のではなく「**アセンブルされなかった**」。
+2. PlasmidFinder が **curated な Col レプリコンを検出** (`Col(IMGS31)` 100% 一致、
+   `Col(pHAD28)`)。MOB-suite の mash 最近傍距離は **0.0008** (既知の K. pneumoniae
+   プラスミドとほぼ同一)。
+3. 小型 contig 同士・染色体との重複は 0〜8% = **反復配列の重複計上ではない**。
+4. **バーコード漏れ (crosstalk) でもない**。同アカウント 303 contig と突き合わせると、
+   8 本中 7 本はどの検体にも出ず、`contig_7` だけが 2 検体 (17558 / 17559_BSI) と共有
+   = 施設内のプラスミド疫学として自然な分布。crosstalk なら高コピー分子が
+   同一ランの多検体に一斉に出るはずで、そうなっていない。
+
+**全 45 ペアでの定量 (小型 contig <20 kb の本数)**:
+新規側 (7/31〜8/5 解析) **51 本** vs BSI 側 (6/16〜6/19 解析) **21 本**。
+**18 ペアで新規側が多く**、BSI 側が多いのは 3 ペアだけ (うち 17559_BSI は
+8/5 に再解析済み = 修正後)。両側とも 8/4 解析の 10 ペアは**全ペアで差 0**。
+→ 差は菌株の違いではなく**解析日 (パイプライン版) で説明できる**。
+
+**運用上の帰結**:
+- **修正前後のアセンブリ間でプラスミド/レプリコンを比較しないこと。**
+  「レプリコン一致」も「プラスミド差分あり」も同じくらい信用できない。
+  [[project_bsi_pair_comparison]] の「旧版はモジュール欠損」と同型の罠で、
+  こちらは**モジュールではなくアセンブリそのもの**が違う。
+- 小型プラスミド回収の修正は `-l/-m 2000` + `target_depth` + `--asm-coverage` 無効化
+  (2026-07-27) と層化ダウンサンプリング (#21)。**効いている**ことが実証された。
+- **concatemer_collapse が小型環状 contig で発火するのは正常。** ONT のリードが
+  小さい環を何周も読むと直列多量体になる。16656 では 4 本が縮約された
+  (`contig_8`: 16,593 bp → 4,148 bp × 4 コピー等)。
+- 16656 の `downsample_info.json` は `species: "..."` / `genome_size: 8,281,440`
+  (mash 由来) で、**#24 の 2 バグが生きていた時期 (7/31 解析) の検体**。
+  ダウンサンプリングは発火していない。
+
 ## ディレクトリ構造 (主要ファイル)
 ```
 tarot-analyzer/
