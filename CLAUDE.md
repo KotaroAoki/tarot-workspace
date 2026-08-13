@@ -309,6 +309,64 @@ PlasmidFinder のような大規模な取りこぼしは**今回は無かった*
 既存の `parse_plasmidfinder` / `parse_bakta`) はガード済み。**backfill を書くときは
 対象パーサのガードを先に入れること。**
 
+### 28.2 「出力実在」ガードのファイル名を間違えると、守るはずのモジュールが全滅する
+**症状 (実測 2026-08-14)**: kaoki_bsi 90 検体のうち **E. coli 14 検体すべて**
+(= fimtyper が走る対象の全数) で `fimtyper_result.json` が `status=FAIL`。
+警告文は `FimTyper を実行できませんでした (FimTyper failed (exit=0))` で、
+**exit=0 なのに failed** という矛盾がそのまま出ていた。
+**真因**: #28.1 で入れた「終了コード**と**出力ファイルの実在の両方で判定する」
+ガードが `results_tab.tsv` を見ていたが、FimTyper が実際に書くのは
+**`results_tab.txt`**。`-s` が常に偽になり、成功時にも `FIMTYPER_ERROR` が
+書かれていた。**#28 の対策が、逆方向の偽陽性 (検査できているのに FAIL) を
+作っていた**形。皮肉なことに `parse_fimtyper.py` の docstring には
+「ファイル名は `results_tab.txt` (`.tsv` ではない)」と正しく書いてある。
+**教訓**:
+- **出力実在で判定するガードを書くときは、そのツールが実際に書くファイル名を
+  実物で確認すること。** 名前を間違えると全数が落ちる。
+- 「陰性」ではなく「FAIL」に倒れるので #28 の無言の偽陰性より発見はしやすいが、
+  **対象菌種の全数が落ちる**ぶん影響は大きい。定期監査では
+  「あるモジュールの FAIL 件数 == その対象菌種の検体数」というパターンを疑うこと。
+- **`failed (exit=0)` のような自己矛盾した警告文は、判定条件そのものが
+  壊れている合図。**
+**復旧**: 出力 (`results_tab.txt` 等) は残っていたので **FimTyper は再実行不要**。
+`workflow/scripts/backfill_fimtyper.py` (dry-run 既定) で 14 件すべて
+FAIL → PASS に復旧した。書き換えるのはモジュール JSON と
+レポートの `ecoli_typing.fimtyping` **だけ** (`backfill_sample_reports.py --force`
+は使わない — #28)。**backfill 実装で踏んだ点が 2 つ**:
+- `build_result()` は ERROR マーカーがあると無条件に FAIL を返す。マーカー自体が
+  誤りなので、**マーカーを除いた一時複製**に対して読み直す (dry-run で現物を触らない)。
+- contigs.fasta との新旧比較は **±600 秒の余裕**を持たせる
+  (`audit_stale_outputs.py` の `MARGIN_SEC` と同値)。NAS への `cp -a` は
+  コピー順で mtime が数秒前後するため、余裕なしだと健全な検体まで弾かれる。
+**妥当性の確認**: 45 ペアは同一分離株を独立に 2 回シークエンスしたものなので、
+**ペア 7 組すべてで FimH 型が一致した**ことが結果の裏づけになった。
+**該当ファイル**: `workflow/rules/stage1_fimtyper.smk`,
+`workflow/scripts/parse_fimtyper.py`, `workflow/scripts/backfill_fimtyper.py` (新規)
+
+### 28.3 モジュール単体の再実行はアセンブリを作り直さずにできる
+同じ監査で `plasmid_outbreak` が 3 検体 (16656 / 20816_BSI / 22178_BSI) で
+旧アセンブリ由来のまま残っていた (`audit_stale_outputs.py` で検出)。
+本番走行中に `register_plasmids_to_db` が例外で落ちて `registration.json` が
+作られず、下流の `check_plasmid_outbreak` も走らなかったのが原因
+(rule ログが 37 本ではなく 36 本になっているのが痕跡)。
+**単独で再実行したら 3 件とも成功**したので、並走時の NAS 競合による
+一過性の失敗と考えられる。再実行は bakta の on-demand と同じ手法で、
+**アセンブリを作り直さずに当該ルールだけ**回せる:
+
+```bash
+snakemake --snakefile $W/workflow/Snakefile --configfile $W/config/config.yaml \
+  --allowed-rules register_plasmids_to_db check_plasmid_outbreak \
+  --config input_dir=$NAS_RESULTS results_dir=$NAS_RESULTS samples=16656 \
+  plasmid_db_path_override=<グループの plasmid DB> \
+  --cores 1 --rerun-triggers mtime --rerun-incomplete \
+  $NAS_RESULTS/16656/plasmid_outbreak/query.json
+```
+
+**`--allowed-rules` は引数を貪欲に取るので直後に `--config` を置く**こと。
+これを省くと後続のターゲット指定まで食われる。`classify_input` を走らせないのも
+重要で、走らせると NAS results を「サンプル入力」として走査し
+`input_class.json` を mode=unknown に上書き破壊する (既知)。
+
 ### 29. cgSNP のスキーム解決は「属内に複数スキームがある属」で丸ごと落ちる
 **症状 (実測 2026-08-05)**: `Klebsiella variicola` / `quasipneumoniae` / `grimontii` /
 `michiganensis` / `aerogenes` の **19 検体**が
@@ -450,6 +508,55 @@ ST1200 を返すが、参照ゲノムとしては遠すぎてコアゲノムが�
   (mash 由来) で、**#24 の 2 バグが生きていた時期 (7/31 解析) の検体**。
   ダウンサンプリングは発火していない。
 
+### 31. 公共 DB に無い ST は、自施設の閉環ゲノムを参照に繰り上げてよい
+**背景**: `backfill_missing_references.py` は NCBI RefSeq を探すが、**その ST の
+complete genome が公共に 1 件も無い**ことがある (実測 2026-08-12: *Citrobacter
+freundii* ST581 / *Enterobacter ludwigii* ST15)。この場合 cgSNP は
+`no reference genome for {species_dir} ST{st}` で skipped になり打つ手が無い。
+一方、当該検体自身が **1 contig の閉環染色体**として組み上がっていることがある。
+outbreak 解析で標準的な「in-study closed genome を参照にする」運用にあたるので、
+**品質ゲートを通れば繰り上げてよい**。ツールは
+`tools/promote_inhouse_reference.py` (dry-run 既定)。
+- **染色体だけ置くこと。** `run_core_snp_map.filter_chromosome_only()` は
+  FASTA ヘッダに文字列 `plasmid` があるかで除外判定するので、Flye のヘッダ
+  (`contig_2_length:76661_cov:111_circular`) のままだとプラスミドが参照に残る。
+  抽出は `molecule/molecule_classification.json` (#19 の単一の真実源) から行う。
+  **書き出すヘッダに `plasmid` の語を入れないこと** (自分で除外されてしまう)。
+- **実体コピーで凍結する。シンボリックリンクは不可。** `input/contigs.fasta` は
+  それ自体がリンクで dangling しうる (#17)。さらに元検体を再解析すると中身が
+  変わり、**その参照で作った BAM DB がまるごと無効になる**。
+- **命名を公共アクセッションと区別する** (`TAROT_{sample}_{species_dir}_ST{st}.fna`)。
+  `find_reference()` は `*.fna` を glob して `[0]` を採るので **ST ディレクトリには
+  1 本だけ**。素性は `REFERENCE_INFO.json` に `provenance: in-house` で残す。
+- 品質ゲート (既定): 閉環 1 contig / CheckM2 完全性 ≥95% ・汚染 ≤5% /
+  genome_size_ratio 0.9〜1.15 / 曖昧塩基 0 / mlst の ST が一致。
+- **自家参照バイアスは距離を歪めない。** 参照由来検体の距離は構造的に 0 に寄るが、
+  リードは全検体独立にマップされるのでペアワイズ距離は保たれる。参照側の
+  ONT 系統誤差も全検体に共通に効くので相殺する (効くのは局所ミスアラインで
+  コアが痩せる方向のみ)。
+- **品質の実測的な裏付けの取り方**: 同一分離株を独立に 2 回シーケンスした検体が
+  あれば dnadiff で比較する。実測 17564 vs 17564_BSI は **SNP 1 / Indel 7 /
+  アライン 100%** で、公共 complete genome に見劣りしないことが示せた。
+- **`min_strains` (既定 4) 未満では系統樹は出ず距離行列だけ**になる。ペアの
+  同一株判定にはそれで足りる。
+**踏んだバグ**: `_ensure_bwa_index` の一時領域が `/tmp` (ワーカーの ext4) で、
+参照は NAS (CIFS) なので `os.replace` が **`Invalid cross-device link`** で必ず落ち、
+**`.fai` が無いまま参照が配置される**。これは #29.1 の faidx 同時生成事故
+(1,486,413 件のエラー) を防ぐための関数自身が機能していなかったということ。
+`tempfile.mkdtemp(dir=reference.parent)` で同一 FS に作れば直る。
+`backfill_missing_references.py` も同じ形だったので併せて修正済み。
+**ECC の扱い**: Enterobacter は属内スキームが 1 つなので ECC 全種が `Ecloacae` に
+吸い寄せられる (#29 の一般則)。ただし **ECC は ST 番号が実質的に種を分けている**
+(実測: ST252=asburiae / ST78・113・1331=hormaechei / ST15=ludwigii) ため、
+ST ごとに種の合った参照が置かれている限り実害は出ていない。
+**参照を新規に置く種から順に分離する**方針とし、2026-08-12 に
+`Enterobacter ludwigii → Eludwigii` のみ追加した。hormaechei / asburiae は
+`Ecloacae` のまま — 移すと bam_db のパスが変わり、既存の完了済み検体
+(ST78 が 8 検体) と同じ木に乗らなくなる。
+**該当ファイル**: `tools/promote_inhouse_reference.py` (新規),
+`tools/backfill_missing_references.py` (`_ensure_bwa_index`),
+`config/config.yaml` の `core_snp.species_scheme_map`
+
 ### 32. mlst の「同一アリル多重ヒット」は ST 決定を諦める理由にならない
 **症状 (実測 2026-08-13, TAS005 / E. coli)**: `icd(12,12)` のため ST が `-` になっていた。
 **原因**: mlst (Seemann) はプロファイル表を**文字列キーで引く**ので `12,12` が
@@ -489,6 +596,79 @@ ST1200 を返すが、参照ゲノムとしては遠すぎてコアゲノムが�
 `workflow/scripts/per_sample_report.py` (`_build_mlst_section`),
 `frontend/src/pages/SampleDetail.tsx`, `frontend/src/lib/htmlExport.ts`,
 `config/config.yaml` の `mlst.db_dir`
+
+### 33. 大腸菌 病原型アラート (DEC / ExPEC) — stx サブタイプの出所と座位の二重計上
+**目的**: 下痢原性大腸菌 (DEC) 6 病原型と ExPEC の重要病原遺伝子を検出したとき、
+1 枚のカードに警告としてまとめる。**新規ツールは実行しない** — VirulenceFinder /
+SerotypeFinder / ShigaPass の既存出力を再解釈する層。
+
+**判定は `workflow/scripts/classify_dec_pathotype.py` のみが行い**、レポートの
+`dec_alerts` セクションに焼き込む。frontend (`DecAlertsCard.tsx`) も
+`htmlExport.ts` もそれを読むだけで判定式を持たない (#19 の二重化事故の再発防止)。
+遺伝子カタログと名称正規化は `workflow/scripts/dec_markers.py` に分離。
+
+**実 DB を確認して分かったこと (2026-08-13)**:
+- **stx のサブタイプは `stx` DB からは取れない。** `stx.fsa` (160 エントリ) の
+  遺伝子名は **`stx1` / `stx2` の 2 種のみ**。サブタイプ (stx1a/1c/1d/1e,
+  stx2a〜stx2o) は **`virulence_ecoli.fsa` にのみ** `stx2c-O157-C394-03` 形式で
+  137 エントリある。**HUS リスクの層別化は virulence_ecoli 依存**。
+- **同一座位が 2 回出る。** E. coli では両 DB が走るので、実測 TAS003 で
+  `stx1` (db=stx) と `stx1a-O157-FLY16` (db=virulence_ecoli) が**同じ contig の
+  同じ座標**にヒットした。パーサの dedup キーは (gene, contig, position) なので
+  名前が違う両者は残る (パーサとしては正しい)。**分類器が (contig, position) で
+  束ね、subtype 付きを採用する**こと。generic 名は virulence_ecoli が拾えない
+  発散型の安全網として併用する。
+- **ABRicate VFDB は DEC のクロスチェックに使えない。** 実データ 118 検体の
+  VFDB ヒット 785 遺伝子に stx / eae / ipaH / elt / est / agg* / bfp / ehxA は
+  **1 件も無く** (共通は `senB` のみ)、命名体系も別でサブタイプも持たない。
+  DEC 判定は virulence_ecoli を単一の権威とする。
+- **遺伝子名は装飾付き**なので完全一致では引けない: `eae-g01-gamma_1`→`eae`(γ1)、
+  `eltIAB-*`→LT-I / `eltIIAB-*`→**LT-II** (動物由来。単独では ETEC と断定しない)、
+  `estah-*`→STh / `estap-*`→STp、`papA_F43`→`papA`、`kpsMII_K1`→`kpsMII`(K1)。
+- DEC の定義的マーカーは全病原型で収載済み。非収載は補強因子のみ
+  (`escV`/`ler`/`set1A`/`daaC`/`ipaB`/`ipaC`/`icsA` 等)。
+
+**`parse_virulencefinder.py` の coverage が全検体で空だった (同時修正)**:
+実ヘッダは `Query / Template length` (スラッシュ前後に空白) だが、パーサは
+空白なしのキーだけを引いていた。空白を潰した正規化キーで引くよう修正し、
+`coverage_fraction` (0-100%) も持たせた。**旧データは `None` = 「不明」であって
+「0」ではない**ので、閾値で弾かないこと。`main()` のガード (#24) も併せて追加。
+
+**検査不能を陰性として描画しない (#28)**: `status` を
+`ok` / `skipped` (対象外菌種) / `unavailable` (**検査不能**) の 3 値で持ち、
+UI は unavailable を赤枠で明示する。実測 TAS003 は stx1a+stx2c+eae γ1 の典型的
+O157 EHEC でありながら **SerotypeFinder が FAIL** しており、最も O157 の確認が
+必要な検体で血清型が取れていなかった。閾値未満で落としたヒットも
+`borderline_markers` に残す (**stx が閾値ギリギリで消えるのが最悪の偽陰性**)。
+
+**実データで見つかった要注意パターン**: TAS008 は **O157:H7 / eae+ / stx−**。
+stx ファージは脱落しうるので、これを単なる atypical EPEC として流すと
+「O157 だが stx 陰性」という疫学上重要な所見が埋もれる。
+`stx_negative_high_risk_serotype` として WARNING を別立てしてある。
+
+**ExPEC は Johnson の定義** (P線毛 / S・F1C線毛 / Dr接着素 / アエロバクチン /
+群2莢膜 の **5 群中 2 群以上**) を採用。重症度は **INFO 止まり** —
+ExPEC マーカーは健常者の常在株にも広く分布し、CRITICAL にすると DEC が埋もれる。
+サブグループ警告として NMEC (`kpsMII_K1`+`neuC`+`ibeA`)・UPEC・pks 島 (`clbB`)・
+HPI (`fyuA`+`irp2`) を出す。
+
+**既存検体**: `workflow/scripts/backfill_dec_alerts.py` (dry-run 既定)。
+ツールは再実行せず、`dec_alerts` セクションだけ差し替える
+(`backfill_sample_reports.py --force` は paidb / molecule_classification 等を
+消すので使わない)。coverage は残っている `results_tab.tsv` から補完するが、
+**TSV の (gene, contig, position) 集合が JSON と一致するときだけ**にする
+(#28 の実測どおり出力ディレクトリには旧実行の残骸が残ることがあり、
+座標が現物と合わない TSV から持ち込む方が有害)。
+**該当ファイル**: `workflow/scripts/dec_markers.py` (新規),
+`workflow/scripts/classify_dec_pathotype.py` (新規),
+`workflow/scripts/backfill_dec_alerts.py` (新規),
+`workflow/tests/test_dec_alerts.py` (新規),
+`workflow/scripts/parse_virulencefinder.py` (coverage + ガード),
+`workflow/scripts/per_sample_report.py` (`_build_dec_alerts_section`),
+`frontend/src/components/DecAlertsCard.tsx` (新規),
+`frontend/src/lib/api.ts` (`DecAlerts` 型), `frontend/src/lib/htmlExport.ts`
+(`renderDecAlerts`), `frontend/src/pages/SampleDetail.tsx`,
+`config/config.yaml` の `dec_alerts` セクション
 
 ## ディレクトリ構造 (主要ファイル)
 ```
