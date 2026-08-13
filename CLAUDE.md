@@ -450,6 +450,46 @@ ST1200 を返すが、参照ゲノムとしては遠すぎてコアゲノムが�
   (mash 由来) で、**#24 の 2 バグが生きていた時期 (7/31 解析) の検体**。
   ダウンサンプリングは発火していない。
 
+### 32. mlst の「同一アリル多重ヒット」は ST 決定を諦める理由にならない
+**症状 (実測 2026-08-13, TAS005 / E. coli)**: `icd(12,12)` のため ST が `-` になっていた。
+**原因**: mlst (Seemann) はプロファイル表を**文字列キーで引く**ので `12,12` が
+見つからず ST を `-` にする。だが `12,12` は「アリルが 2 種類あって決められない」
+ではなく「**同じアリル 12 が 2 箇所で完全一致した**」という意味で、
+プロファイル自体は一意。実際 12-12-8-12-15-2-2 は PubMLST `ecoli_achtman_4` の
+**ST11 (ST11 Cplx = O157:H7 系統)** に一意に一致する
+(icd 以外 6 座位が同じ ST は他に 23 個あるが全て icd が別番号)。
+`parse_mlst.py` は `st == "-"` をそのまま WARN で通していただけだった。
+**同一番号の重複が起きる主因はアセンブリ側** — Flye が解けなかった反復は
+それを挟む contig の両端に重複出力される (#20)。
+**混合株・真のパラログなら通常アリル番号が食い違う (`12,20`)** ので、
+同一番号 2 つは重複由来を強く示唆する。
+**解決**: `parse_mlst.build_result()` (純粋関数, 単一の真実源) が
+**全ヒットが同一番号の座位だけ**を潰し、mlst 同梱のプロファイル表
+(`<mlst>/db/pubmlst/{scheme}/{scheme}.txt`, `config.mlst.db_dir` で上書き可)
+を引き直して ST を確定する。ネットワーク不要。
+- **番号が食い違う座位が 1 つでもあれば潰さない** (`ambiguous_loci` に記録し
+  「混合株を疑え」と出す)。`~n` / `n?` / `-` を含むプロファイルも手を出さない
+  (そもそも表引きできない)。
+- **痕跡を消さない**: `allelic_profile` は生表記 (`12,12`) のまま、潰した後を
+  `resolved_allelic_profile`、重複座位を `duplicated_loci`、
+  `st_resolution: "deduplicated"` を残す。UI と HTML エクスポートは
+  該当アリルを黄色くし「重複除去で確定した ST」である旨を必ず併記する
+  (**ST の数字だけ見せると mlst が返した ST と区別が付かない**)。
+- 副次効果: `run_core_snp_map.py` の「stringMLST 不発 → mlst の ST に
+  フォールバック」経路が救われる (ST が `-` だと cgSNP が skipped になり得た)。
+- 既存検体は `workflow/scripts/backfill_mlst.py` (dry-run 既定)。
+  **mlst は再実行せず** `mlst/mlst.tsv` を読み直すだけ。レポートは
+  `mlst` セクションだけ差し替える (#28: `backfill_sample_reports.py --force` は
+  paidb / molecule_classification 等を消すので使わない)。
+  プロファイル表が引けないと救済が 1 件も起きないので、起動時に probe して
+  WARN を出す (#29.1 の「失敗が成功と同じ見た目になる」対策)。
+**該当ファイル**: `workflow/scripts/parse_mlst.py` (`build_result`,
+`find_profile_table`, `lookup_st`), `workflow/scripts/backfill_mlst.py` (新規),
+`workflow/rules/stage1_mlst.smk` (parse_mlst に `params.db_dir`),
+`workflow/scripts/per_sample_report.py` (`_build_mlst_section`),
+`frontend/src/pages/SampleDetail.tsx`, `frontend/src/lib/htmlExport.ts`,
+`config/config.yaml` の `mlst.db_dir`
+
 ## ディレクトリ構造 (主要ファイル)
 ```
 tarot-analyzer/
