@@ -743,6 +743,71 @@ arm64/x86_64 の問題は起きない)。
 `frontend/src/pages/DoradoJobDetail.tsx` (待機中カード),
 `config/config.yaml` の `dorado.max_concurrent_basecalling`
 
+### 35. cgSNP の比較集団を ST より細かく切る (E. coli = fimH サブタイプ)
+**動機**: cgSNP DB の「Species × ST groups」は表示上の分類ではなく、
+**`bam_db/{species}/{群}/` がそのまま系統樹の比較集団**
+(`collect_bams` はこのディレクトリ 1 つしか見ない)。E. coli では ST だけでは粗く、
+ST 内の亜系統を分けたい。2026-08-14 に fimH 型 (FimTyper) をサブタイプ層として導入。
+
+**設計の要点 (壊さないこと)**:
+- **群 (`group`) と ST を別物として持ち回る。** 群は `"{ST}_{subtype}"`
+  (例 `11_H82`)、ST は素の `11`。**参照ゲノムは ST 単位にしか存在しない**
+  (`representative_genomes/ST{st}/`) ので、参照解決に群を渡すと必ず外す
+  (検証済み: `find_reference(st="11_H82")` → None)。`mapping_info.json` /
+  `metadata.json` / `core_snp_result.json` は ST と subtype を**別フィールドで**持つ。
+- **判定は `workflow/scripts/core_snp_subtype.py` だけが行う** (#19 の二重化事故の
+  再発防止)。Snakemake ルールも移行ツールも `resolve_subtype()` を呼ぶだけ。
+  API 側にあるのは表示用の**分解**のみで、判定ロジックは持たせていない。
+- **サブタイプのラベルに `_` を含めない。** 群名の分解は最初の `_` で行う
+  (ST は数値か `any` で `_` を含まないので曖昧にならない)。`normalize_label()` が
+  `[A-Za-z0-9.-]` 以外・24 文字超・パス区切りを弾き、通らなければサブタイプ無し。
+  **推測でディレクトリを作らない。**
+- **型が確定しない検体は ST のみの群に残す** (ユーザー決定)。FimTyper が
+  FAIL (= 検査不能) でも WARN (= 新規変異体) でも `{ST}_HNA` のような群を作らない。
+  検査不能を独立クラスタに化けさせないため (#28 と同じ趣旨)。理由は
+  `subtype_status` (`ok`/`not_configured`/`missing`/`unavailable`/`no_call`/`invalid`)
+  と `subtype_detail` に必ず残し、UI は `unavailable` を
+  **「fimH 陰性ではなく判定できていない」**と明示する。
+- **`core_snp_map` の input に fimtyper の結果を足す**
+  (`_core_snp_subtype_inputs`)。まだ書かれていない結果を「型なし」と読むと
+  ST 群に登録され、**登録先は後から変えられない** (他検体の系統樹が既にその群を
+  参照する)。追加コストはゼロに近い — 既に mlst を待っており、同じ段で走る。
+  config が空なら 0 件 = 従来と同一の依存関係。
+- **BAM キャッシュも群単位で切る** (`localize_bams`)。ST だけで切ると別サブタイプの
+  BAM が同じキャッシュに混ざる。
+
+**既存 DB の移行 = `tools/migrate_bam_db_subtype.py` (dry-run 既定)**:
+- BAM/BAI を新しい群へ移し、移動元・移動先の `metadata.json` を
+  **一時ファイル + `os.replace`** で書き換える (#25)。
+- **各検体の `core_snp/mapping_info.json` にも `group` を書く。** 系統樹だけ
+  作り直す経路 (`--allowed-rules core_snp_phylo`) は core_snp_map を回さないので、
+  **mapping_info.json が唯一の群の手がかり**。ここを忘れると次の phylo が
+  古い群を見に行く。
+- 既に `{ST}_{subtype}` になっている群はスキップ = **冪等**。
+- dry-run は移行後の群ごとの株数を出し、2 株未満 (解析不可) / 4 株未満
+  (距離行列のみ) に印を付ける。**BAM の中身も既存の系統樹結果も触らない。**
+
+**実データでの影響 (2026-08-14, NAS 全アカウント)**: E. coli 44 株。
+**ST11 (kaoki_stec, O157/STEC) 以外はすべての ST 群が fimH 単一**だったため、
+群名が変わるだけで比較集団は痩せない。ST11 のみ 22 株 → **H82 17 株 + H36 5 株**
+に分かれる (どちらも `min_strains`=4 を満たすので系統樹は両方出る)。
+他は ST1060-H27(5) / ST131-H41(4) / ST1011-H31(2) / ST2040-H38(2) /
+ST641-H25(2) / ST744-H54(2) / ST998-H76(2) / ST141-H5(1) / ST95-H27(1)。
+**FimTyper 未確定の検体は 0 件**だった。
+
+**他の菌種へ広げるときは config だけでよい** — `core_snp.subtyping` に
+`{species_dir: {module, result_json, field, strip_prefix, label_prefix, accept_status}}`
+を足し、移行ツールを流す。**移行せずに設定だけ入れると壊れはしないが、
+既存株が旧群・新規株が新群に入って比較集団が痩せる。**
+**該当ファイル**: `workflow/scripts/core_snp_subtype.py` (新規・単一の真実源),
+`tools/migrate_bam_db_subtype.py` (新規), `workflow/tests/test_core_snp_subtype.py` (新規),
+`workflow/scripts/run_core_snp_map.py` (`store_bam_to_db(group=)`, Phase 5.5),
+`workflow/scripts/run_core_snp_phylo.py` (`collect_bams(group)`, `localize_bams(group)`),
+`workflow/rules/stage2_core_snp.smk`, `config/config.yaml` の `core_snp.subtyping`,
+`api/services/db_manager.py` (`_split_group_dir`, scan に `st_base`/`subtype`),
+`api/routers/results.py` (`/core_snp_db` の group_id, `core_snp_db_info` が群を数える),
+`frontend/src/pages/CoreSnpDbBrowser.tsx`, `frontend/src/components/CoreSnpSection.tsx`
+
 ## ディレクトリ構造 (主要ファイル)
 ```
 tarot-analyzer/
