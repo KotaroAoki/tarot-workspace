@@ -670,6 +670,79 @@ HPI (`fyuA`+`irp2`) を出す。
 (`renderDecAlerts`), `frontend/src/pages/SampleDetail.tsx`,
 `config/config.yaml` の `dec_alerts` セクション
 
+### 34. dorado の GPU は 1 ジョブで飽和する — 重ねても速くならず、到達後の basecall は丸損
+**背景**: New Job から Dorado Basecalling を 2 本投入したら GPU に余裕があるか、
+という問いから 2 件の無駄が見つかった。どちらも「GPU が空いているように見えて
+実は空いていない / 空けても意味が無い」という同じ誤解に根がある。
+
+**(a) ジョブを重ねてもスループットは増えない。**
+dorado は `--device` を渡していないので **1 プロセスが全 GPU を掴む**。さらに
+1 ジョブが `_run_distributed` で**全ワーカーにまたがる** (各ワーカーが作業キューから
+pod5 を 1 つずつ取る) ので、**1 ジョブ走らせた時点で 3 台とも埋まっている**。
+実測 2026-08-14 (kaoki_stec, 3 ワーカー): 単独 26 秒/chunk → 2 本目が合流した
+時点で **61 秒/chunk (単独時の 43%)** に低下し、**合計は横ばい〜微減**。
+`_preflight_workers` は SSH 疎通とディスク残量しか見ておらず GPU 使用率も VRAM も
+チェックしないため、3 本目も普通に受け付けて全員が遅くなる。
+**計測方法**: NAS の `accounts/{group}/dorado_runs/{job_id}/demux/chunk_NNN/` の
+birth time と mtime の差 (`stat -f '%SB' / '%Sm'`)。**同時に走っている chunk 数 =
+ワーカー台数**なので並列度もここで分かる。API を叩く必要は無い。
+
+**解決**: `_gpu_slot` (asyncio.Semaphore) で basecalling 区間を
+`dorado.max_concurrent_basecalling` 本 (既定 2、0 以下で無制限) に制限する。
+- **囲むのは basecalling だけにすること。** `monitoring` (coverage 判定) と
+  `downstream` (Snakemake 完了待ち) は GPU を使わないので、そこまで含めると
+  **下流解析の完了待ちでベースコールが詰まる**。
+- **realtime はラウンド単位で確保する。** `rescan_max_seconds` 既定 12 時間の間
+  pod5 の到着待ちでアイドルするので、ジョブ全体で握ると空いた GPU を遊ばせたまま
+  後続を待たせる。
+- **`queued` が長時間続くようになるので `delete_job` でタスクを畳むこと。**
+  止めずに `_jobs` から消すと、順番が回ってきたときに **UI に出ないジョブが
+  basecalling を始める**。`queued` の表示側 (型 / "Queued" ラベル / ポーリング継続)
+  は既にあったが、`DoradoJobDetail` の `phase_detail` カードは
+  `status === 'basecalling'` でしか描画しないので待機理由用のカードを足した。
+
+**(b) Coverage Progress が 100% になった後も basecalling が走り続けていた。**
+`threshold_met` になった時点で `_measure_barcode_coverage` が下流解析を起動して
+おり、**以降に basecall したリードはその解析には二度と混ざらない** (起動時点の
+fastq を読んで走っているため。`_run_realtime` の docstring にも「閾値到達済みの
+バーコードには追加しない」と明記されている)。原因は
+`_incremental_monitor_loop` が全到達を検知して**自分のループを抜けるだけ**で、
+`_worker_loop` は作業キューの pod5 を最後まで処理し続けていたこと。
+**解決**: `_should_stop_basecalling(job)` を `_worker_loop` が**次の pod5 を
+取りに行く前**に見て抜ける。`_basecall_pod5_batch` の単一ワーカー逐次ループと
+`_recover_workers` の復帰ループも同じフラグを見る。
+- **実行中のチャンクは中断しない。** リモートは nohup で走っており、途中で殺すと
+  中途半端な BAM が NAS に残る。チャンク境界で止めるので打ち切り時に最大で
+  ワーカー台数ぶん余分に処理される。
+- **`job.barcodes` が空のときの `all([]) == True` を明示ガードすること。**
+- **打ち切りを WARNING で出さないこと。** `_run_distributed` 末尾の「未処理 pod5」
+  ログをそのまま使うと、本物の取りこぼし (ワーカー全滅等) と区別が付かなくなる。
+- **効かない経路**: batch + ワーカー 1 台 (`_run_basecalling_single`) は pod5
+  ディレクトリ全体を 1 本の nohup スクリプトで流すので途中打ち切りができない。
+  この経路はそもそも並行 coverage 判定が無い (basecalling 完了後に
+  `_monitor_coverage_loop` が回る) ので対象外。
+
+**(c) `api/` の編集は実行中の dorado ジョブを消す — さらにリロード自体が刺さる。**
+API は `uvicorn --reload --reload-dir .../api` で動いており、`_jobs` は
+**インメモリ**、オーケストレーションは asyncio タスクなのでプロセスと心中する。
+リモートで nohup 済みの現チャンクだけは走り切るが次の pod5 は誰も投げない。
+再投入しても job_id が変わり `run_dir` が別になるので**完了済みチャンクの `.done`
+も再利用されない**。**編集は必ずジョブが無い時に行うこと。**
+加えて、**フロント (Vite プロキシ経由) の SSE ログストリームが開いていると
+リロードが完了しない**。旧ワーカーは graceful shutdown に入るが SSE 接続が
+自然に閉じないため待ち続け、旧ワーカーが終わらないので新ワーカーも上がらず
+**API 全体が無応答になる** (curl は HTTP=000)。見分け方は
+`lsof -nP -iTCP:8000 -sTCP:LISTEN` に**親 PID しか出ない** (旧ワーカーが LISTEN を
+手放している) + `-sTCP:ESTABLISHED` に `node`(Vite) ↔ Python が残っていること。
+**SIGTERM では死なない** (既に SIGTERM 処理中)。`kill -KILL <旧ワーカー PID>` で
+リローダが即座に新ワーカーを spawn して復旧する (同じインタプリタで再起動されるので
+arm64/x86_64 の問題は起きない)。
+**該当ファイル**: `api/services/dorado_runner.py` (`_gpu_slot`,
+`_max_concurrent_basecalling`, `_should_stop_basecalling`, `_run_job`,
+`_worker_loop`, `_recover_workers`, `_run_realtime`, `delete_job`),
+`frontend/src/pages/DoradoJobDetail.tsx` (待機中カード),
+`config/config.yaml` の `dorado.max_concurrent_basecalling`
+
 ## ディレクトリ構造 (主要ファイル)
 ```
 tarot-analyzer/
