@@ -1110,3 +1110,39 @@ UI (`CoreSnpSection` / `CoreSnpDbBrowser`) に混在を明示する。
 - **2 株だけの比較は ClonalFrameML が走らない** (`if n_strains >= 3`)。
   ペア距離は「ペアだけで測り直す」のではなく**群単位の距離行列から読む**こと。
 
+### 39. dorado の中間 BAM (dorado_runs) は完了時に消す — 下流が読むのは fastq
+**背景 (2026-08-28)**: `_process_single_pod5` は 1 pod5 ごとに basecall → demux し、
+demux BAM を NAS の `dorado_runs/{job_id}/demux/chunk_NNN/` へコピーする。
+**消す処理が無かった**ため実測で **NAS 全 4 アカウント合計 284 GB**
+(kaoki_stec 219 GB / toho_micro_id_bsi 37 GB / kojima 16 GB / toho_omori 12 GB、
+41 ジョブ) が積み上がっていた。
+
+**消してよい根拠**: 下流 Snakemake が読むのは
+`dorado_samples/{job_id}/{sample}/{sample}.fastq.gz` の方
+(`_measure_barcode_coverage_inner` が BAM から生成し、そのまま入力パスに置く)。
+下流の自動再投入 (`downstream_max_retries`) も **fastq を再利用する**ので
+BAM は要らない。完了後に BAM を読む API も無い (`worker_demux_dirs` を使うのは
+coverage 計測だけ = 完了前)。
+
+**実装**: `DoradoRunner._cleanup_run_dir()` を `_run_job` の末尾
+(status=completed の後) で呼ぶ。`config.dorado.cleanup_intermediate_bam`
+(既定 true) で無効化可。
+- **削除するのは completed のときだけ。** failed / cancelled は原因調査のため
+  残す (例外経路には呼び出しを置かない)。
+- **run_dir の形を確認してから消す** — `/{output_subdir}/{job_id}` で終わること、
+  絶対パスであること、job_id が `[A-Za-z0-9._-]+` であること。パス組み立てが
+  将来変わっても無関係なディレクトリを `rm -rf` しないため。
+- 削除**前**に件数とサイズを測り `CLEANUP:<件数>:<バイト数>` を stdout に出して
+  ジョブログに載せる。跡地に `CLEANED.txt` を残す
+  (**「消えた」と「消した」を区別できるようにする** — #28 と同じ趣旨)。
+- 失敗しても例外を投げず WARNING に留める (解析結果には影響しないため)。
+- `wc -l` の出力は環境によって空白が付くので `tr -d '[:space:]'` で潰すこと
+  (ログに `demux BAM        2 件` と出る)。
+**既存の滞留分**: `tools/cleanup_dorado_intermediates.py` (dry-run 既定)。
+**`dorado_samples/` の fastq が 1 つ以上あるジョブだけ**を対象にする
+(fastq 化まで到達していない = やり直しの余地があるジョブを消さないため)。
+pod5 と fastq には触らない。`CLEANED.txt` の有無で冪等。
+**該当ファイル**: `api/services/dorado_runner.py`
+(`build_cleanup_command`, `_cleanup_run_dir`, `_run_job`),
+`tools/cleanup_dorado_intermediates.py` (新規),
+`config/config.yaml` の `dorado.cleanup_intermediate_bam`
