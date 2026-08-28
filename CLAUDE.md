@@ -824,6 +824,70 @@ ST641-H25(2) / ST744-H54(2) / ST998-H76(2) / ST141-H5(1) / ST95-H27(1)。
 `api/routers/results.py` (`/core_snp_db` の group_id, `core_snp_db_info` が群を数える),
 `frontend/src/pages/CoreSnpDbBrowser.tsx`, `frontend/src/components/CoreSnpSection.tsx`
 
+### 36. 「押しても何も起きない」= API は 200 を返すが実体が動いていない 2 パターン
+2026-08-19 に利用者から「Cancel が効かない」「再実行しても Dashboard にジョブが出ない」と
+2 件続けて指摘され、どちらも **HTTP は成功、UI にエラーも出ない** 無言失敗だった。
+**原因は別物だが、症状の見え方が同じ**なので併記する。
+
+#### 36.1 Cancel の停止根拠は `_ssh_process` ではなく PGID
+**症状**: on-demand cgSNP の臨時ジョブ (`adhoc_20260819_152825_384b33`) で Cancel を
+押しても status が RUNNING のまま。API は 200 を返す。
+**原因**: `cancel_job` が `if job.status == RUNNING and job._ssh_process:` で分岐して
+いた。`_ssh_process` (ローカルの asyncssh プロセスハンドル) を保持するのは
+**`_run_all_batches` (レガシーのバッチ経路) だけ**で、`_run_core_snp_batch`
+(on-demand cgSNP / adhoc ジョブ) は保持しない → **分岐に入らず完全な no-op**。
+冒頭の account ジョブ分岐 (`sample_worker or pending_samples`) も adhoc は両方空で素通り。
+**解決**: RUNNING なら必ず ①**先に** `status=CANCELLED` を確定 (kill が先だと
+`_monitor_batch` の EOF 側が FAILED を書きうる) → ②`kill -TERM/-KILL -- -{job.pid}`
+→ ③stale lock 解除、の順で実行する。**停止の根拠は `job.pid` (setsid で捕捉した PGID)**
+であってプロセスハンドルではない。実行中の `core_snp_status` は `failed` ではなく
+`cancelled` にし、`_run_core_snp_batch` / `run_core_snp_adhoc` が **CANCELLED を
+FAILED に上書きしない**ようにする (従来は書き戻していた)。
+**同時に塞いだ穴**: PGID 未捕捉時のフォールバック
+`pkill -TERM -f 'snakemake.*{input_dir}'` は、**input_dir が汎用名のときは撃たないこと**
+(`_GENERIC_INPUT_DIRS`)。adhoc cgSNP は `input_dir="results"` なので、そのまま撃つと
+同一ワーカーで走る**無関係な全ジョブの snakemake に一致する**。ハング検知の
+`_kill_remote_and_unlock` も同じ形だったので併せて修正。
+**副作用 (承知の上)**: API の graceful shutdown (`--reload` 保存時を含む) は
+`main.py` の lifespan で実行中ジョブに `cancel_job` を呼ぶので、**adhoc cgSNP も
+リモートごと停止するようになった**。従来は no-op で nohup のまま生き残っていた。
+**フロント**: `CoreSnpStatus` に `cancelled` を追加。**未知の status は既定で
+「完了」カードに落ちる**作りなので、追加を怠ると中断が完了に見える。
+PipelineTimeline では `cancelled` → `skipped` 扱い (`pending` のままだと
+`coreSnpUnfinished` が真のままで後処理行が永久に完了しない)。
+
+#### 36.2 DB から復元したジョブは `session_token` を持たない
+**症状**: TAS256 で Core SNP を再実行しても **Dashboard にジョブが生成されない**。
+エラー表示も無い。`/api/jobs` は total も running 数も変化しない。
+**原因 (2 段)**:
+1. `load_persisted_jobs` は **`session_token` を復元しない (空文字)**。API を
+   リロードすると、直前の adhoc cgSNP ジョブが `status=FAILED` /
+   `samples=[対象サンプル]` / `output_dir="results"` で復元される。
+2. `POST /jobs/core_snp/by-samples` の Step 1 (サンプル → ジョブ対応づけ) が
+   **その復元ジョブを拾い**、`run_core_snp_for_job` (= 既存ジョブに紐付ける経路。
+   **新しいジョブを作らない**) に回す。さらにその中で
+   `open_process(job.session_token="")` が「セッションが無い」で即失敗するため、
+   数秒で cgSNP だけが failed になり **画面上は完全に無反応**。
+**解決**:
+- Step 1 で **`session_token` を持たないジョブを除外**する。これで Step 2 の
+  NAS 参照 → **臨時ジョブ作成**に回り、生きたセッションで実行され一覧にも出る。
+- `run_core_snp_for_job` は実行前に **`job.session_token` を今ログイン中の
+  セッションのトークンへ貼り替える**。パスと DB override は既に `session` 側から
+  取っているのでトークンだけで文脈が揃う。**復元ジョブだけの話ではない** —
+  再ログイン後に古いジョブから再実行しても同じ無言の失敗になるため必須。
+- 併せて `asyncio.create_task(...)` の戻り値を捨てていた 6 箇所を `_spawn_bg()`
+  (強参照保持) に変更。GC でタスクが消えると、これも同じ「無言で何も起きない」になる
+  (runner 側が `_spawn` を持つのと同じ理由)。
+**未対応 (同じ構造が残っている)**: Bakta / plasmid cluster の後追い実行も
+インメモリ JobRecord を実行文脈として再利用するので、復元ジョブ・失効トークンで
+同じ失敗をしうる。**インメモリ JobRecord を実行に使う箇所は、必ず
+`session_token` が生きているかを疑うこと。**
+**該当ファイル**: `api/services/snakemake_runner.py` (`cancel_job`,
+`_GENERIC_INPUT_DIRS`, `_kill_remote_and_unlock`, `_run_core_snp_batch`,
+`run_core_snp_adhoc`, `run_core_snp_for_job`), `api/routers/jobs.py`
+(Step 1 のフィルタ, `_spawn_bg`), `frontend/src/lib/api.ts` (`CoreSnpStatus`),
+`frontend/src/components/CoreSnpSection.tsx`, `frontend/src/components/PipelineTimeline.tsx`
+
 ## ディレクトリ構造 (主要ファイル)
 ```
 tarot-analyzer/
@@ -879,3 +943,170 @@ tarot-analyzer/
 - `TAROT_SSH_HOST`: SSH ホスト (デフォルト: 環境依存)
 - `TAROT_SSH_PORT`: SSH ポート (デフォルト: 22)
 - `TAROT_REMOTE_ROOT`: リモートプロジェクトルートテンプレート (デフォルト: `/mnt/c/ftproot/tarot-pipeline`)
+
+### 37. Illumina ショートリード対応 — 骨格はあったが未実行、露出した穴は 3 つ
+**前提**: 短鎖リードの骨格 (classify_input の R1/R2 検出、SPAdes ルール、
+`get_input_fasta` の分岐、fastq アップロード、UI のモード表示、`NODE_N` の
+contig 名正規化) は v2.0 で実装済みだったが、**一度も実行されていなかった**
+(NAS 全 7 アカウント 515 検体で `assembly/short_read/` は 0 件)。
+2026-08-19 に SRR12628569 (E. coli O157) を `TAS002_Illumina` として初投入した。
+
+**アセンブリ自体は実用水準**: 74× / 191 contig / N50 124 kb / CheckM2 完全性 100.0・
+汚染 0.07。同一分離株の ONT 版 (`TAS002_ONT`) と **ST11・FimH82・O157:H7・
+STEC/EHEC・stx2c・MOB cluster AA345 まで完全一致**した。QUAST の ONT 較正閾値
+(N50<10 kb / contigs>500 で WARN) も素通りするので、閾値の作り直しは急がない。
+molecule 判定も環状性の証拠ゼロで status=PASS / `genome_size_ratio 0.972` /
+判定不能は 37 contig (全体の 3.2%) に収まり、断片化による劣化は軽微だった。
+
+**実測で分かった SPAdes の性質 (思い込みを 3 つ壊した)**:
+- **`--isolate` はリード補正を行わない** (ログ: `Mode: ONLY assembling (without
+  read error correction)`)。`--only-assembler` は不要で、補正済みリードの残骸も出ない。
+- **既定メモリ上限は「実機の RAM 全量」** (honban で `Memory limit (in Gb): 216`)。
+  250 GB 固定ではない。**1 ワーカーで N サンプル並走させると各々が RAM を
+  丸ごと自分のものだと思い込む** ので `-m` の頭割りが要る
+  (`spades_mem_divisor` を `--config` で渡す。#25 の `core_snp_phylo_jobs` と同じ形)。
+- **`cov_` は k-mer 被覆であって read 被覆ではない。** 実測 read 74× に対し
+  ヘッダは `cov_42.4` (K55 換算で約 0.60 倍)。**低被覆フィルタの閾値を read 被覆の
+  感覚で置くと 2 倍近く外す。** shovill の `--mincov 2` と同じ k-mer 基準で置くこと。
+- `spades_output/` は **84 MB が NAS までアーカイブされていた** (検体 203 MB の 41%)。
+  成功パス末尾の `rm` しか無く EXIT trap が無かった (#project_assembly_intermediate_fastq_leak
+  と同型)。`assembly_graph_with_scaffolds.gfa` だけは残す価値がある —
+  `assembly/short_read/assembly_graph.gfa.gz` に置けば `results.py` の
+  assembly-graph-gfa は既に `("long_read","short_read")` を走査するので **API 改修なしで**
+  既存の GfaGraph ビューアが使える。
+
+#### 37.1 プラスミド照会が無言で消える (最重要)
+**症状**: 同一分離株の ONT 版と Illumina 版で、アウトブレイク照会の結果が正反対になった。
+ONT は AA345 で **160 件マッチ / `trigger_layer_b: true`**、Illumina は
+**同じ AA345 を検出しているのに `num_plasmids: 0` / `num_with_matches: 0`**。
+**原因**: `plasmid_outbreak.require_circular` (既定 true) で短鎖リード contig は
+1 件も登録されない → `check_plasmid_outbreak.py` は **登録した uid を起点に**
+DB を引く設計なので照会が 1 件も走らない → 「マッチ無し」として正常終了。
+しかも `num_skipped: 0` で**「プラスミドはあったが見送った」痕跡すら残らない**。
+**解決**: `_read_contig_report()` が `(登録対象, 見送り)` を返し、`registration.json` に
+`withheld_clusters` を残す。`check_plasmid_outbreak` は `non_circular` で見送った
+クラスタも **read-only で照会**する (`known_vector` / `variant_segment` は
+「プラスミドとして扱わない」判断そのものなので照会しない)。
+**`trigger_layer_b` は登録済みのマッチだけで決めること** — Layer B.1 は DB 内 FASTA を
+母集団に走るので、DB に居ないプラスミドで起動しても当の検体がクラスタに入らない。
+UI と HTML には「DB 未登録・照会のみ」を明示する。
+**検証**: Illumina は 0 → **184 件マッチ**、ONT は構造上 `registered` キー追加のみで不変。
+
+#### 37.2 cgSNP が「完了」と表示される (#28 の UI 版)
+`core_snp_phylo` は skip / insufficient / failed でも `core_snp_result.json` を書いて
+exit 0 する。ところが API は `MODULE_CHECK_MAP` の**ファイル実在だけ**を見ており、
+`core_snp` は `_OPTIONAL_MODULE_FILES` (完了後に status を読むリスト) に**入っていなかった**。
+その結果、short_read 検体 (cgSNP は input_mode で SKIPPED) が UI で緑チェックの
+「完了」になっていた。`_OPTIONAL_MODULE_FILES` に追加し、ポーラが status を読んで
+`skipped`/`failed`/`completed` を出し分けるようにした。
+**読み出しは `sftp_*` ではなく既存接続への `exec_command` で行うこと** —
+SFTP 経路は失敗時に接続を張り直し、`_poll_sample_module_status` の docstring どおり
+監視ストリーム (open_process) を巻き添えにしうる。
+
+#### 37.3 cgSNP の Illumina 対応は「引き算」でできる
+ONT 経路の Phase 1-4 (fastplong → DeChat → wgsim) は要するに
+**「長鎖リードから擬似ペアエンドを作る」**工程なので、Illumina では丸ごと不要。
+fastp をかけて Phase 5 (stringMLST) 以降にそのまま渡せばよい (stringMLST も BWA も
+本来この形の入力を想定している)。**ただしマッパーは分けること** —
+`bwa bwasw` は長鎖向けでペア情報も捨てるため 150 bp には不適 (`bwa mem` を使う)。
+**ONT 側は bwasw のまま変えないこと**: 既存 BAM DB が全て bwasw 由来で、
+差し替えると同一 ST 群の BAM 再構築と再検証が要る (#23)。
+ダウンサンプルは **R1/R2 を同一シード (`seqkit sample -s 42`) で引いてペアを保つ**。
+**BAM DB は ONT と同じ群に同居させる** (ユーザー決定) が、`metadata.json` /
+`mapping_info.json` / `core_snp_result.json` に `platform` を必ず記録する。
+**platform キーの無い旧登録は ONT。**
+理由: 全検体が同一プラットフォームならその系統的エラーは全 BAM に共通に乗るので
+距離計算では相殺されるが、**混在すると相殺が効かず跨ぐペアの距離だけが膨らみうる**。
+UI (`CoreSnpSection` / `CoreSnpDbBrowser`) に混在を明示する。
+**較正値の実測 (2026-08-20): `TAS002_ONT` × `TAS002_Illumina` = 0 SNP**
+(コアゲノム 4,302,461 bp / 168 株の群)。両者の距離行列の行は他の全株に対しても
+完全に一致し、次に近い株は 18 SNP 離れている。**同居させる決定の前提は実測で
+裏付けられた**が、これは DeChat 補正済み ONT R10 を十分な被覆で読んだ n=1 の値。
+低被覆 ONT でも 0 である保証は無いので、ペアが増えたら再確認すること。
+
+#### 37.4 その他
+- **hybrid は名前負けしている。** 両方あると `mode=hybrid` になるが
+  `get_input_fasta` は SPAdes contigs を返すだけで**長鎖リードは捨てられる**。
+  真の hybrid アセンブラは未導入。ルールのログに明記した (ユーザー決定: 現状維持)。
+- **リード QC** (`per_sample_report` の `read_qc` セクション) を追加。
+  `fastp.json` を **params 渡し**で読む (circularity.json と同じ理由 = DAG を変えない
+  = ONT 検体に影響しない)。推定被覆 = トリム後総塩基 ÷ `genome_size_map`。
+  **fastp.json が無いモードは `not_applicable` で返し 0x とは書かない** (#28)。
+- `input/contigs.fasta` は NAS 上で dangling symlink になる (#17)。ONT と同じ挙動で
+  ダウンロード API のフォールバックが効くので新規の問題ではない。
+- **phylo は株数に強くスケールする。** 実測 2026-08-20: `Ecoli/11_H82` 群 168 株で
+  **`core_snp_phylo` だけ 4 時間 50 分** (ジョブ全体 5h18m のうち、レポート生成までは
+  28 分)。#23 の 12.6 分は 22〜28 株のときの値。`core_snp.max_strains: 200` なので
+  群が育つとそのまま効く。mpileup (全位置で N 個の BAM を読む)・ClonalFrameML・
+  RAxML (`-f a -N 1000`) がいずれも株数に効く。**Illumina 対応とは無関係。**
+  大量再実行 (例: [[project_cgsnp_phylo_nameerror_st]] の 250 検体) を計画するときは
+  先に max_strains を決めること。
+- **DB の `jobs` 行は実行中の状態を持たない。** `_persist(job)` はサンプル完了時と
+  ジョブ確定時にしか呼ばれないので、走行中は `status='queued'` / `started_at=NULL` のまま。
+  UI が「実行中」を出せるのはインメモリの JobRecord を読んでいるから。
+  **DB をポーリングして進捗を追おうとしないこと。** 走行中に API がリロードされると
+  そのジョブは `queued` のまま復元され、#36.2 の「無言で何も起きない」条件が揃う。
+**該当ファイル**: `workflow/rules/stage1_spades_assembly.smk`,
+`workflow/scripts/filter_spades_contigs.py` (新規), `workflow/rules/stage2_core_snp.smk`,
+`workflow/scripts/run_core_snp_map.py` (`run_fastp_paired`, `run_bwa_mapping(platform=)`,
+`store_bam_to_db(platform=)`), `workflow/scripts/run_core_snp_phylo.py`,
+`workflow/scripts/register_plasmids_to_db.py` (`_read_contig_report` の 2 値返し),
+`workflow/scripts/check_plasmid_outbreak.py`, `workflow/scripts/per_sample_report.py`
+(`_build_read_qc_section`), `workflow/rules/stage4_aggregate.smk`,
+`api/services/snakemake_runner.py` (`_sweep_intermediates_cmd`, `_read_core_snp_status`,
+`_CORE_SNP_MODES`, `spades_mem_divisor`), `api/services/db_manager.py`,
+`api/routers/results.py`, `config/config.yaml` の `assembly.short_read` /
+`core_snp.fastp_*`, frontend (`SampleDetail` / `CoreSnpSection` / `CoreSnpDbBrowser` /
+`PlasmidProfileSection` / `htmlExport` / `api.ts`)
+
+### 38. 検証スクリプトの既定値を本番 config と一致させること — 存在しない問題を 2 日追った
+**事故 (2026-08-21〜22)**: 同一分離株を ONT と Illumina で読んだ 79 ペアの cgSNP 距離が
+**中央値 5〜6 SNP** 離れており、原因究明に丸 2 日を費やした。置換スペクトル解析
+(C↔G 1.8% = 低被覆アーティファクトではない)、メチル化モチーフ照合
+(Dcm/Dam 一致 0/311 = 背景以下)、反復配列の同定 (不一致サイトの 73.6% が反復領域 =
+ランダムの 9.5 倍、74.2% が 500bp 以内に集中 = 同 26 倍) まで進め、
+**反復領域マスクを実装**して中央値 5 → 1 まで改善させた。
+
+**ところが本番設定で測り直したら、マスク無しで中央値 0・79 組すべて 5 SNP 以下だった。**
+
+**真因**: 検証に使った `cgsnp_subset.py` の既定値が `--varscan-min-freq 0.9` で、
+**本番 config は 0.01** だった (`core_snp.varscan_min_freq`)。
+`min_freq 0.9` は「90% が同じ塩基なら確信して呼ぶ」ので、反復領域で誤マップが
+多数派を占めた位置を**そのままコンセンサスに入れる**。本番の 0.01 は同じ位置を
+ヘテロ (`/`) と判定してコアから除外するため、問題が最初から出ない。
+`varscan_min_coverage` も本番 8 に対し検証は 10 だった。
+
+| 条件 | コア率 | ペア距離中央値 | 0 SNP |
+|---|---|---|---|
+| **本番 (mc8, f0.01)** | **75.2%** | **0** | **51/79 組** |
+| mc10, f0.9 | 65.6% | 5 | 0 組 |
+| mc5, f0.9 | 85.1% | 8 | 0 組 |
+| mc10, f0.9 + 反復マスク | 63.3% | 1 | 39 組 |
+
+**教訓**:
+- **解析ツールを新規に書くとき、パラメータの既定値を自分で決めないこと。**
+  必ず `config.yaml` の対応する値と一致させる。`cgsnp_subset.py` /
+  `pairwise_cgsnp.py` の既定は 8 / 0.01 に修正済み (理由もコードに書いた)。
+- **本番と違う条件で出た数値を「本番の問題」として報告しないこと。** 今回は
+  ユーザーに 4 条件の比較表まで示して本番化の承認を得る直前まで行った。
+  実装 (反復マスク) 自体は正しく動いたが、**解こうとしていた問題が存在しなかった**。
+- 調査の過程で使った診断ツールは有効だった (置換スペクトル / 位置の再現性 /
+  モチーフ濃縮)。**手法ではなく前提条件の確認が抜けていた。**
+- `varscan_min_freq 0.01` は「反復領域を自動的に除外する仕組み」として
+  既に機能している。**この値を上げてはいけない。**
+
+**残した成果物** (既定 `None` / 未使用で本番の挙動は不変):
+`workflow/scripts/build_repeat_mask.py` (k-mer 一意性マスク生成、`is_masked` に
+境界処理を集約)、`run_core_snp_phylo.run_mpileup_consensus(masked_positions=)`。
+将来 `min_freq` を上げる場面があれば使える。import 失敗時は WARN を出して
+マスク無効に落ちるので、同期ずれで cgSNP が全滅することはない。
+
+**副産物として確定したこと**:
+- クロスプラットフォーム (ONT×Illumina) の同一分離株は**本番設定で 0〜2 SNP**。
+  79 組中 51 組が 0 SNP、10 SNP 超は 0 組。#37.3 の「較正値 = 0 SNP」(n=1) は
+  n=79 で追認された。
+- `cgsnp_subset.py` (新規) で bam_db の**部分集合**・プラットフォーム別の
+  cgSNP 解析ができる。`run_core_snp_phylo` の関数を import するので手順は同一。
+- **2 株だけの比較は ClonalFrameML が走らない** (`if n_strains >= 3`)。
+  ペア距離は「ペアだけで測り直す」のではなく**群単位の距離行列から読む**こと。
+
