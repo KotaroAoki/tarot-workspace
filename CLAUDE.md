@@ -1260,3 +1260,104 @@ IncL/M で、しかも**中心との DCJ=0 が 6 菌種にまたがる**。こ�
 宿主メタデータ付与), `api/routers/results.py` (分離日の付与),
 `frontend/src/lib/api.ts` (`host_species` / `host_st` / `isolation_date` +
 2 つの status), `frontend/src/components/PlasmidDistanceMap.tsx`
+
+### 42. 近いプラスミド同士の構造比較 (Genetic Distance Map からのペア比較)
+**動機**: 距離マップは「どれとどれが近いか」しか出さず、**なぜ DCJ=3 なのか**
+(挿入か / 反転か / 反復のコピー数差か) が見えなかった。エッジ・ノード・
+メンバー一覧の行から 2 本を選び、線形シンテニー + 遺伝子トラックで並べる層を足した。
+
+**判定と座標計算は `workflow/scripts/compare_plasmid_structure.py` のみが行う。**
+frontend (`PlasmidStructureCompare.tsx`) は描くだけ (#19 の二重化事故の再発防止)。
+API はこのスクリプトを **base64 で送ってワーカーで実行する** (`_rows_via_remote` と
+同じ idiom = workflow/ の同期を当てにしないので版ずれが原理的に起きない)。
+
+**エンジンは blastn -subject。pling ブロックは補助層に留めること。**
+pling は既に全ペアのブロック分解を座標付きで出している
+(`plasmid_clusters/pling/unimogs/{batch}_align.unimog` と `_map.txt`。符号付き整数列で
+反転も入っている。中央値 10 ブロック/ペア、DCJ=0 なら 1 ブロック) が、
+**`plasmid_clusters/` は最後の on-demand 実行で丸ごと上書きされる**。
+実測 2026-08-29: kaoki_stec は最後が manual 3 サンプル実行だったため
+`all_plasmids_distances.tsv` が **1 ペアだけ**で、DB 373 本・距離マップ 184 ノードの
+AA345 にブロックが**存在しない**。pling だけを描画源にすると一番見たいクラスタで
+無言の空欄になる (#40)。**pling が無いことは「差が無い」ではない** ので
+`available=false` + 理由を必ず返して UI に出す。
+- blastn は py39 に既存 (`config.paidb.blast_path`)、`-subject` で DB ビルド不要
+  (`screen_known_vectors.py` と同形)。実測 0.3〜1.2 秒/ペア (76〜390 kb)。
+- 閾値は **pling と同じ値**にしてある (`identity 80.0` / `length 200`。pling.log の
+  `identity_threshold` / `length_threshold`)。**自分で決めないこと** (#38)。
+- 同一クラスタ外のペアは megablast だと拾えないので、被覆 30% 未満なら
+  **dc-megablast で引き直し、どちらで引いたかを出力に残す** (#29.1)。
+
+**座標は全部そのまま乗る (実測で確認済み)**: `plasann/plasmid_contigs/{cid}.fasta` /
+`db/plasmid_outbreak/by_cluster/{cid}/{uid}.fasta` /
+`plasmid_clusters/all_plasmids/{uid}.fasta` の 3 つが **md5 一致**、かつ
+`assembly/long_read/contigs.fasta` の当該 contig とも一致する。したがって
+AMRFinder / PlasmidFinder / MEFinder の contig 座標はオフセットを足すだけで乗る。
+PlasAnn だけは**プラスミド単位 FASTA 上の座標**なので、単位 FASTA の contig 並びが
+一致することを**実物で確かめてから**使う (一致しなければ出さない — #22)。
+
+**原点ズレは避けて通れない**。dnaapler で repA 起点に回転済みなのは
+**395 本中 279 本 (71%) だけ**で、残り 116 本は未回転。線形に並べると原点差が
+巨大な転座に見えるので、最長の共線 HSP を錨に **query の「描画座標だけ」** を
+回転/反転する。**配列・contig 名・座標そのものは絶対に書き換えない** (#21/#22)。
+適用したかどうかと錨の長さは出力に残し UI に出す。原点をまたぐ HSP と遺伝子は
+**2 片に割って両方返す** (片方だけ描くと遺伝子が消えたように見える。実測
+17575__AA002 の `aadA22` が該当)。
+
+**共線性はオフセットの一致率で測ってはいけない。** 1 か所の挿入で下流のオフセットが
+全部ずれ、実際には共線なのに「大規模再配列」と誤報する (実測 17570 vs 17575 は
+14 kb の挿入 1 か所で 0.64 まで落ちた)。**枠を当てた後に順序で測る**
+(`collinear_fraction` = 長さ加重 LIS)。挿入/欠失は共線のまま、転座と反転だけが落ちる。
+
+**多 contig プラスミドは pling が 1 配列しか見ていない。** 実測 11045__AA739 は
+390,789 bp のうちブロック座標が 384,222 までしか無い (6,568 bp の linear contig が
+落ちている)。連結座標軸で描き、contig 境界を図に明示し、警告に出す。
+多 contig の query は**原点合わせをしない** (どこが原点か定義できない)。
+
+**キャッシュは `{db_path}/_structure_cache/` に置く** — `plasmid_clusters/` に置くと
+再実行で消える。有効性は**入力 FASTA の size + mtime** で判定すること
+(`plasmid_uid` は `{sample}__{cid}` なので**再解析しても uid が変わらないまま中身が
+変わる**。#26 の BAM キャッシュと同じ罠)。許容は 1 秒未満。実測 1.2 秒 → 0.07 秒。
+
+**採らなかった選択肢**: pling の `--visualisation` は**ネットワーク図**であって
+構造比較図ではない (今の MST の下位互換)。pling 全体の再実行は 148 プラスミドで
+8 分・184 なら 1.5〜2 時間でクリック応答に使えない。clinker / pyGenomeViz は
+新規 env が要るうえ独立 HTML / 静止画で、エイリアス層 (#18) にも既存 UI にも乗らない。
+
+**中心アンカーのスタック (中心 1 本 vs 近い順 N 本)**: 同じエンドポイントで
+`query_uid` を繰り返すと `plasmid_structure_stack/1` が返る (schema で見分ける)。
+ペアごとの計算は `compare()` をそのまま使い、**ペア表示とキャッシュを共有する**
+ので、片方で開いた組は他方でも即時になる。
+- **行はリボンではなく「中心上の位置の色」で塗る** (Mauve と同じ考え方)。10 行に
+  リボンを引くと毛玉になる。色は順序のある量なのでカテゴリ色ではなく知覚的に単調な
+  ランプ (viridis) を使う (#41 と同じ方針)。
+- **ブロック 1 個を 1 色で塗らないこと。** DCJ=0 のペアは全長が 1 ブロックになるので
+  中点の色で塗ると行全体が単色になり、**「中心と同じ並びである」という一番読ませたい
+  情報が消える**。ブロック内部も位置に応じて塗り分けると、同一なら中心のグラデーションが
+  そのまま再現され、反転していれば**グラデーションが逆向きに出る** (実測 19403__AA002 の
+  52 kb 反転)。サブ矩形は隣と 0.75px 重ねること (アンチエイリアスの白い縞が模様に見える)。
+- 相手の並び順は**呼び出し側 (frontend) が決める**。DCJ が計算済みのものを優先し、
+  未計算は後ろへ回す (「遠い」ではなく「分からない」なので上位に混ぜない)。
+- **FASTA を解決できなかった相手も行として残す** (赤い破線)。黙って落とすと
+  「並べられなかった」が「差が無い」に見える (#28)。
+- 上限 `MAX_STACK_QUERIES=24` (1 ペア約 1 秒 × N)。距離マップは 184 ノードになり得る。
+
+**該当ファイル**: `workflow/scripts/compare_plasmid_structure.py` (新規・単一の真実源。
+`compare` / `compare_stack` / `plasmid_fasta_candidates` — **パスの知識も API に
+複製しないこと**), `workflow/tests/test_compare_plasmid_structure.py` (新規),
+`api/services/result_parser.py` (`get_plasmid_structure_comparison` — uid を渡すだけ),
+`api/routers/results.py` (`GET /api/results/plasmid_structure`。`query_uid` は配列で、
+1 本ならペア・複数ならスタック),
+`frontend/src/lib/api.ts` (`PlasmidStructureComparison` / `PlasmidStructureStack` 型),
+`frontend/src/components/PlasmidStructureCompare.tsx` (新規・ペア),
+`frontend/src/components/PlasmidStructureStack.tsx` (新規・スタック),
+`frontend/src/components/PlasmidDistanceMap.tsx` (`onCompare` — **effect の依存に
+入れないこと**。力学配置が毎レンダーでリセットされる),
+`frontend/src/components/PlasmidProfileSection.tsx` (**文脈キーを持たせて描画時に
+判定する**。effect で setState して閉じると 1 フレーム古いペアの取得が飛ぶ)
+
+**スクリプトは stdin で送ること。** base64 でコマンドラインに載せると単一引数が
+約 71 KB になり Linux の `MAX_ARG_STRLEN` (128 KB) に余裕が無い
+(`summary_row.py` は 17 KB なので既存経路はそのままでよい)。
+**blastn の探索パスにユーザー名を決め打ちしないこと** — アカウント制のワーカーは
+mbuser とは限らない。`_build_remote_command` の conda_init と同じ prefix 列を使う (#1)。
