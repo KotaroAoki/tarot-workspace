@@ -1146,3 +1146,117 @@ pod5 と fastq には触らない。`CLEANED.txt` の有無で冪等。
 (`build_cleanup_command`, `_cleanup_run_dir`, `_run_job`),
 `tools/cleanup_dorado_intermediates.py` (新規),
 `config/config.yaml` の `dorado.cleanup_intermediate_bam`
+
+### 40. フロントの `.catch(() => null)` は #28 の UI 版 — 距離マップが 10 日間死んでいた
+**症状 (2026-08-28)**: 24266 の Genetic Distance Map (DCJ-Indel MST) が、
+セクション見出し・プラスミドセレクタ・表示範囲トグルまでは出るのに
+**本体だけが何も描かれない**。エラー表示もローディング表示も無い。
+
+**「無言」の理由 = フロントの握り潰し**。`PlasmidProfileSection.tsx` の
+距離マップ用 `useQuery` が `queryFn: () => fetch...().catch(() => null)` になっており、
+**失敗が「成功 (値 null)」に化けていた**。結果 `isLoading=false` /
+`data=null` / `isError=false` の三拍子が揃い、`{distanceQ.data && <PlasmidDistanceMap/>}`
+が何も返さないまま**エラー分岐にも入らない**。
+`|| true` で外部ツールの終了コードを捨てるのと同じ構造で、**#28 の UI 版**。
+- **空欄 = 取得失敗であって singleton ではない。** 真に単独クラスタなら
+  `PlasmidDistanceMap` が `No related plasmids — singleton cluster` を出す。
+  **この文言が出ていない空欄は必ず失敗**と読むこと。
+- **`--reload` の裏で 500 が出続けていても画面は静か**なので、
+  発見が「なんで出ないんでしたっけ」という会話に依存していた。
+
+**真因 = `_parse_int` の定義だけが消されていた** (`NameError`)。
+`git log -S_parse_int` で `fc2271b` (2026-08-18, 「一覧ロードを 14.6 秒 → 3.67 秒に」)
+がヘルパ定義を削除しており、`get_plasmid_distance_map` の呼び出し 1 箇所だけが
+取り残されていた。**発火条件が絞られているせいで気づけない**:
+この行は **DB `index.tsv` の行が `plasmid_clusters_merged.json` に無いとき**しか通らない。
+一方アカウントセッションは router が `db_path = session.group_plasmid_db_path` を
+**常に強制**するので DB index ループは必ず回る → index (151 行) と merged (148) が
+ズレた瞬間に 500。つまり **8/18 以降、アカウント経由の距離マップは実質全滅**していた。
+- **未使用に見えるヘルパを消すときは呼び出し側を grep すること。** 静的検査は
+  入っていない (pyflakes/flake8 とも未導入)。**`python -c` の AST 走査で
+  F821 相当は数秒で回せる** — ただしクロージャの外側スコープ参照が偽陽性で出る。
+- `_parse_int` は **`index.tsv` が `csv.DictReader` で全列を文字列で返す**ために要る。
+  `size_bp` を素通しするとフロントの `size_bp / 1000` が壊れる。
+  **空欄・非数値は 0 ではなく `None` (= 不明)** にすること (0 は「サイズ 0 bp」と読める)。
+
+**入れた可視化 (3 段)**:
+1. `api.ts` に **`ApiError` (status 付き Error サブクラス)** を追加し、
+   `request()` / `fetchDownload()` / アップロード 2 箇所の throw を統一。
+   **`message` は従来どおり FastAPI の `detail`** なので既存の表示文言は不変。
+2. 距離マップの `.catch(() => null)` を削除し、`isError` 時に理由付きの警告ボックスを出す。
+   **404 (= クロスアイソレート解析が未実行) と それ以外 (= 読み取り失敗) で文言を分ける**
+   — 対処が違うため。末尾に `HTTP <code> · <detail>` を等幅で必ず出す。
+3. `/plasmid_distances` の router で parser 呼び出しを try/except し、
+   **実例外を `detail` に載せて 500 を返す** (`logger.exception` も出す)。
+   `api/main.py` に例外ハンドラが無いので、これが無いと素の
+   `Internal Server Error` になり **404 との区別しかできない**。
+**react-query v5 の注意**: 「初回ロード中」は `isLoading` で見ること。
+**`isPending` は `enabled: false` でも true** になるので、
+中心プラスミド未選択のときに「Loading…」が出っぱなしになる。
+
+**このカードだけが単独で失敗しうる理由**: SampleDetail の他のカードは
+サンプル自身の report JSON 由来だが、**距離マップだけがバッチ階層の
+`results/plasmid_clusters/` を SFTP で読む**。他が全部出ていても、
+ここだけ死ぬのは構造上ありうる (切り分けの起点にすること)。
+**該当ファイル**: `api/services/result_parser.py` (`_parse_int` 復活),
+`api/routers/results.py` (`get_plasmid_distance_map` の try/except),
+`frontend/src/lib/api.ts` (`ApiError`),
+`frontend/src/components/PlasmidProfileSection.tsx` (握り潰し除去 + エラー表示)
+
+### 41. 距離マップに疫学の軸 (菌種 / 分離日) を載せる — Phase 1
+**動機**: Genetic Distance Map (DCJ-Indel MST) はノードに `plasmid_uid` と
+carbapenemase しか出しておらず、**carbapenemase が空のクラスタでは完全に無地**
+だった。実測 toho_micro_id `AA002` は 34 プラスミド / **14 菌種** (Klebsiella 6種・
+Enterobacter 4種・Citrobacter 2種・E. coli・S. marcescens) がすべて 87.3 kb の
+IncL/M で、しかも**中心との DCJ=0 が 6 菌種にまたがる**。これは
+「同じプラスミドが菌種を超えて広がっている」= **cgSNP 系統樹では原理的に見えない
+このパネル固有の情報**なのに、画面上は灰色の丸が並ぶだけだった。
+
+**データは既にあった (新規計算ゼロ)**:
+- **菌種・ST** = `results/{sample}/report/{sample}_summary.json` (サマリー行キャッシュ)。
+  `_rows_via_remote` に相乗りするので **SSH 1 コマンド**で 184 ノードでも済む。
+  実測 kaoki_stec は DB プラスミドの 222 サンプル全件にキャッシュがある。
+- **分離日** = アカウント DB の `sample_metadata` (ルータで引くだけ、I/O ゼロ)。
+  実測 kaoki_stec は 259 件登録済みで、DB プラスミドの 222 サンプルと **100% 重なる**。
+- **地域は存在しない** (Phase 2 で `sample_metadata` に列追加が要る)。
+
+**踏んではいけない罠**:
+- **`by_cluster/*.meta.json` の `mash_neighbor_identification` を菌種に使わないこと。**
+  あれは「そのプラスミドの mash 最近傍 (公共 DB エントリ) の宿主」であって、
+  この検体の同定結果ではない。名前が紛らわしく、そのまま使えてしまう。
+- **`index.tsv` の `registered_at` は解析日**であって分離日ではない。
+- **「取得失敗」を「該当なし」に化けさせない** (#28 / #40 と同じ)。
+  `host_metadata_status` / `isolation_date_status` を返し、UI は
+  「菌種 不明」「分離日 未登録」と「取得失敗」を書き分ける。
+- **色分け軸は固定にできない。** 群ごとに効く軸が違う — kaoki_stec `AA345` は
+  184 個すべてが E. coli ST11 (菌種では塗り分かれない) で分離日が 5.5 年に分散、
+  toho_micro_id `AA002` は 14 菌種だが分離日が未登録。既定は**データを見て決める**
+  (2 菌種以上 → 菌種 / 2 年以上 → 分離年 / それ以外 → 出所)。
+- **カテゴリ色は 3 枠まで。** 力学配置は任意の 2 ノードが隣り合うので all-pairs で
+  CVD 検証が要る (`#2a78d6` / `#eb6834` / `#1baf7a` は deutan ΔE 9.2・normal ΔE 24.0
+  で通過)。4 色目以降は通らないので**「その他」に畳み**、内訳は凡例注記と一覧表が持つ。
+  14 菌種を 14 色にしないこと。**分離年は順序のある量なので単一色相の明→暗ランプ**
+  (5 段) を使う — カテゴリ色を年に割り当てない。
+- **直接ラベルは 1 菌種 1 個だけ。** 全ノードに付けると 34 ノードで完全に潰れる。
+- **`plasmid_uid` をそのままノードラベルにしない。** `{sample}__{cluster}` なので
+  同一クラスタを見ているときはクラスタ部分が全ノード共通 = 雑音
+  (実測 AA667 の 52 ノードが全部 `TASxxx_ONT__AA667`)。表示名だけにし、
+  別クラスタのノードにだけクラスタ ID を添える。**表とツールチップでは
+  内部 ID を併記する** (#18)。
+- **`useSampleAliases()` の戻り値そのものを d3 effect の依存にしないこと。**
+  毎レンダー新しいオブジェクトなので力学配置が毎回リセットされる。中身の
+  `aliases` マップ (useSyncExternalStore のスナップショット) を依存にする。
+- **「中心との DCJ」を MST 経路長で代用しないこと。** 直接ペアが未計算のときは
+  「未計算」と出す (別の量を同じ列に混ぜない)。
+
+**入れたもの**: 1 文サマリ (「34 プラスミド · 14 菌種 (…) · 分離日 …」+ 複数菌種の
+警告)、色分け軸セレクタ (菌種 / 分離年 / 出所)、出所はリング様式・carbapenemase は
+赤ハローへ移動、菌種をまたぐエッジのツールチップ明示、**メンバー一覧表**
+(サンプル / 出所 / 菌種 / ST / 分離日 / サイズ / rep / carbapenemase / 中心との DCJ、
+ソート可)。表は 34 ノードの `AA002` で「同一 IncL/M が DCJ=0 で 6 菌種に分布」を
+一目で読ませる。**HTML エクスポートは距離マップを出力していない**ので今回は対象外
+(一覧表だけなら移植可能)。
+**該当ファイル**: `api/services/result_parser.py` (`get_plasmid_distance_map` の
+宿主メタデータ付与), `api/routers/results.py` (分離日の付与),
+`frontend/src/lib/api.ts` (`host_species` / `host_st` / `isolation_date` +
+2 つの status), `frontend/src/components/PlasmidDistanceMap.tsx`
