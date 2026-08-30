@@ -1342,6 +1342,85 @@ PlasAnn だけは**プラスミド単位 FASTA 上の座標**なので、単位 
   「並べられなかった」が「差が無い」に見える (#28)。
 - 上限 `MAX_STACK_QUERIES=24` (1 ペア約 1 秒 × N)。距離マップは 184 ノードになり得る。
 
+**円環表示 (BRIG 風) は直線表示の置き換えではなく併用**: 円環は**中心の座標を角度に**
+するので全リングを同じ角度で比較でき「どこが欠けているか」が読める代わりに、
+**相手だけが持つ配列を原理的に描けない**。直線は各相手自身の座標に描くので
+そちらが見える。UI に両方置き、円環側にはこの制限を明記する。
+- 角度が位置を表すので、色は**一致率**に使う (BRIG と同じ)。ただし同一クラスタの
+  プラスミドは一致率がほぼ飽和してリングが全部同じ色になるため、**リング番号を
+  12 時の位置に振って**下の凡例リストと紐付ける。
+- **番号の下に必ず地 (濃い円) を敷くこと。** 12 時の位置がその相手に無い領域だと
+  白抜き文字が薄い地に乗って消える (実測 17575 の番号 1 が消えた)。
+
+**HTML 書き出しは「描画済みの DOM を複製する」こと。** 図の幾何を書き出し用に
+書き直すと、片方だけ直したときに画面と出力が食い違う (#19 と同型で、図の場合は
+「報告書に載せた図だけが古い」という形で表面化する)。操作用の要素には
+`data-export-skip` を付けて複製時に落とし、CSS 変数は文書の外で解決されないので
+現在の計算値へ焼き込む。出力は単体で開ける 1 ファイル。
+**図だけが独り歩きする**ので、DCJ は別計算であること・原点を回している場合が
+あること・「共有していない」は遺伝子が無いことを意味しないこと・取得できていない
+検査結果は図に出ないことを、注記として必ず添える。
+
+**任意ペアの比較は最初から可能で、制約は選択 UI だけだった。** 構造比較は
+plasmid_uid さえあれば走る (FASTA は命名規約で DB から解決する) が、距離マップは
+「中心と同じクラスタ / community」しか出さないので、そこからは**無関係な
+プラスミド同士を選べない**。`PlasmidComparePickerDialog` でグループ DB 全体から
+基準・相手を選べるようにした。
+- そのために `/api/results/plasmid_db` に**個々のプラスミド** (`plasmids[]`) を
+  足した。従来はクラスタ集計しか返しておらず plasmid_uid が取れなかった。
+  実測 150〜373 行で 29〜76 KB。
+- **DB 未登録のプラスミドを取りこぼさないこと。** 環状に閉じていない contig は
+  DB に載らない (`require_circular`) ので、距離マップ由来の候補も混ぜて
+  「DB 未登録」バッジで区別する。
+- **スタックの行に出す DCJ は「その図の基準との距離」にすること。** 基準を任意に
+  選べるようになったので、距離マップの中心との距離を流用すると別の量を同じ列に
+  出すことになる (#41 の「MST 経路長で代用しない」と同型)。
+- 別クラスタ同士は実測で `dc-megablast` に落ちて共有 8.8% (どちらの経路を使ったかは
+  出力に残る)、無関係なら `no_alignment`。**どちらも正常な応答**として扱う。
+
+**プラスミドの carbapenemase は一度も記録されていなかった (2026-08-30 に判明)。**
+`index.tsv` / `manifest.tsv` の `carbapenemase_genes` が全 8 アカウントで空だった。
+原因は独立した 3 つで、**どれか 1 つでも残ると空のまま**になる:
+1. **AMRFinder の出力キーの取り違え。** `parse_amrfinder.py` が書くのは `gene`
+   なのに、抽出側は `gene_symbol` / `element` / `name` しか見ていなかった。
+   これ単独で常に空になる。
+2. **contig 名を素の文字列で比較していた。** MOB の contig_report と FASTA ヘッダは
+   dnaapler が付けた `rotated=True rotated_gene=repA` まで持つが、**AMRFinder は
+   最初の空白で切る**。実測 19396 で完全一致 0/2。
+3. **公共アセンブリのヘッダは `contig_key` で吸収できない。** `CP136026.1
+   Escherichia coli strain ... [topology=circular]` は `contig|tig|node|scaffold`
+   の正規表現に当たらず、説明文ごと小文字化されて必ず外す。(2) を直しても
+   harada_ndm は 0 件のままで、これを直して 14 件になった。
+**修正**: 抽出を `circularity_util.carbapenemase_genes_from_amrfinder` に集約し
+(`collect_plasmid_fastas.py` と `register_plasmids_to_db.py` は呼ぶだけ)、
+突き合わせは `contig_match_key` (**先に最初のトークンだけにしてから** `contig_key`)。
+既存 DB は `workflow/scripts/backfill_plasmid_carbapenemase.py` (dry-run 既定)。
+**2026-08-30 に 114 行へ適用済み** (バックアップは各 DB の `_backup/<timestamp>/`)。
+AMRFinder 結果が無い検体は触らない (不在を陰性にしない)。
+**実データの規模**: 114 プラスミド / 5 アカウント
+(toho_micro_id 66・toho_micro_id_bsi 23・harada_ndm 14・toho_micro_id_temp 9・kojima 2。
+blaIMP-1 / blaIMP-6 / blaIMP-11 / blaNDM-5)。
+**影響**: 表示だけでなく `merge_plasmid_clusters` の notable_clusters の
+**並び順 (carba 保有を最優先)** と `num_carba_clusters` が効いていなかった
+(常に 0)。クラスタが消えることは無いが、carbapenemase クラスタが上位に来ない。
+**教訓**: 空欄は「非保有」と読めるので誰も気づかない (#28 と同型)。
+**外部ツールの出力キーと contig 名の突き合わせは、実データで 1 件通してから
+確定させること。**
+
+**`carbapenemase_genes` は index.tsv に `;` 区切りで書かれている**
+(`";".join(carba)`) のに読み出し側が `,` で割っていた。`_split_db_list` に
+集約して両方受けるようにした。
+
+**ダウンロードは `<a download>` を文書に挿入してからクリックし、revoke は
+遅延させること。** 実測 2026-08-30: 切り離したままの `<a>` を click していたため
+ブラウザが `download` 属性を無視し、**毎回同じ既定名で保存 = 2 つめが 1 つめを
+上書き**していた。`URL.revokeObjectURL` を click 直後に同期で呼ぶのも同じ症状を
+起こす (blob を読み終える前に消える)。ファイル名は**ミリ秒まで入れたうえで
+同値なら連番を足す** — 秒までだと同じ比較を続けて保存したときに衝突して
+1 つめが消える。「まず起きない」で済ませるとファイルが消える。
+`pages/Results.tsx` の一括 HTML 出力も同じ壊れ方をしていたので
+`downloadHtml` に寄せた (**blob をダウンロードさせる箇所は全部この形にすること**)。
+
 **該当ファイル**: `workflow/scripts/compare_plasmid_structure.py` (新規・単一の真実源。
 `compare` / `compare_stack` / `plasmid_fasta_candidates` — **パスの知識も API に
 複製しないこと**), `workflow/tests/test_compare_plasmid_structure.py` (新規),
@@ -1350,7 +1429,14 @@ PlasAnn だけは**プラスミド単位 FASTA 上の座標**なので、単位 
 1 本ならペア・複数ならスタック),
 `frontend/src/lib/api.ts` (`PlasmidStructureComparison` / `PlasmidStructureStack` 型),
 `frontend/src/components/PlasmidStructureCompare.tsx` (新規・ペア),
-`frontend/src/components/PlasmidStructureStack.tsx` (新規・スタック),
+`frontend/src/components/PlasmidStructureStack.tsx` (新規・スタック。直線/円環),
+`frontend/src/lib/plasmidStructureExport.ts` (新規・DOM 複製による HTML 書き出し),
+`frontend/src/components/PlasmidComparePickerDialog.tsx` (新規・任意ペアの選択。
+**基準との DCJ 列は距離マップのエッジではなく pling の全ペアから引く** — 距離マップは
+中心と同じクラスタしか持たないので任意の基準には足りない),
+`workflow/scripts/circularity_util.py` (`carbapenemase_genes_from_amrfinder`,
+`contig_match_key`), `workflow/scripts/backfill_plasmid_carbapenemase.py` (新規),
+`workflow/tests/test_carbapenemase_extraction.py` (新規),
 `frontend/src/components/PlasmidDistanceMap.tsx` (`onCompare` — **effect の依存に
 入れないこと**。力学配置が毎レンダーでリセットされる),
 `frontend/src/components/PlasmidProfileSection.tsx` (**文脈キーを持たせて描画時に
