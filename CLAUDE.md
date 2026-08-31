@@ -1571,6 +1571,89 @@ rotated_gene=repA` がそのまま入っていた。
 `frontend/src/components/PlasmidStructureCompare.tsx` (枠の説明文),
 `frontend/src/lib/api.ts` (`circular: boolean | null`)
 
+### 42.3 構造比較に「連鎖」を足した — 星型と鎖は別の問いに答える図
+**動機**: `plasmid_structure_stack/1` の 3 モード (直線 / 円環 / シンテニー) は
+すべて**星型** = 中心 1 本と各相手を比べた図で、CLAUDE.md #42 のとおり注記にも
+「相手同士を直接比べた図ではありません」と書いてあった。3 本以上並べたとき、
+**隣り合う相手同士がどう違うのか**が読めない。Easyfig / clinker の多段比較と
+同じ「鎖」を足した (`plasmid_structure_chain/1`)。
+- **置き換えではない。** 星型は「中心からどれだけ / どこが離れているか」、
+  鎖は「並べた順に何が起きたか」を読む図。中心が決まっている問い (この検体の
+  プラスミドが DB のどれに近いか) では星型が正しい。
+- 計算は同じ `compare()` を使うので、**ペア表示・星型・鎖の 3 つが同じ
+  キャッシュを共有**する (先頭リンクは既存エントリにそのまま当たる)。
+
+**座標をどう揃えるか (唯一のややこしい点)**: 鎖では 1 本のプラスミドが
+「1 つ上の相手の query」と「1 つ下の相手の reference」を**兼ねる**。バーは
+1 本しか描かないので、両方の役で同じ座標でなければならない。
+- 各トラックに表示枠を 1 つだけ決める: `D[0] = 生座標`、
+  `D[i+1] = compare(tracks[i], tracks[i+1], reference_frame=D[i])` が返す枠。
+- **枠の合成を自前で書かないこと。** `compare()` に `reference_frame` を渡すと
+  **reference 側 (q 座標) に枠を当ててから** `estimate_frame` を呼ぶので、
+  返る枠がそのまま「表示された reference に揃った 1 つの変換」になる。
+  回転と反転の合成則 (`reverse∘rotate` が別オフセットの reverse になる) を
+  手で書くと必ず間違える。
+- reference 側への適用は `apply_ref_frame_to_hsp` = **q と s を入れ替えて
+  `apply_frame_to_hsp` を使い回す**。`_split_on_origin` の対応関係
+  (順鎖 q_lo↔s_lo / 逆鎖 q_lo↔s_hi) が左右対称なので成立する。
+  **分割規則を 2 か所に書かないこと。**
+- 実データで往復検証済み (2026-08-31, toho_micro_id AA002): 17575 の遺伝子座標が
+  「link1 の query」と「link2 の reference」で**完全一致**。反転が伝播する経路
+  (19403 が reverse=True、次のリンクがその上で offset 62,729 を出す) でも一致。
+- **配列は書き換えていない** (#21/#22)。回したのは描画座標だけで、何を当てたかは
+  各トラックの `frame` に残してツールチップに出す。
+
+**途切れても打ち切らない** (#28): FASTA を読めないトラックがあっても、その前後の
+リンクを unavailable にして**次から生座標で鎖を張り直す**。トラックもリンクも
+落とさず理由付きで返し、UI は赤い破線 + 「差が無いという意味ではありません」を出す。
+
+**並べ替えは index ではなく plasmid_uid で持つこと。** 並べ替えた直後は図
+(`data.tracks`) が 1 つ前の並びのまま残る (`placeholderData` でちらつきを防いでいる)
+ため、**行番号が `order` の位置と一致しない**。index で動かすと 2 手目が別の行を
+掴む。▲▼ の可否も `order.indexOf(uid)` で決める。ドラッグと ▲▼ は同じ
+`moveUid` を通す。
+- **並びが変われば比較する組み合わせ自体が変わる** = 図の内容が変わるので、
+  並びは導出値ではなく**ユーザーの入力**。HTML 書き出しの facts に必ず載せる。
+- 「DCJ が近い順に辿る」は貪欲な最近傍法。**先頭は動かさない** (どこから辿るかは
+  利用者が決めたこと)。**未計算のペアに距離を捏造しない** — 現在の並びのまま
+  末尾へ回す。DCJ の出所は距離マップのエッジではなく **pling の全ペア**
+  (`fetchPlingClustersRaw`)。距離マップは中心との距離しか持たないので任意の
+  隣接ペアには足りない (#42 のピッカーと同じ理由)。
+
+**モード切替を図の中だけに置かないこと。** 「連鎖」を押すと星型のクエリが止まり
+鎖の取得が始まるので、**取得中・失敗中は切替ボタンごと画面から消えて戻れなくなる**。
+データが無い間は親 (`PlasmidProfileSection`) 側にも切替を出す。
+
+**pling ブロック境界も出せる (2026-08-31 追加)**。ただし **pling の分解は
+ペアごと**なので、鎖では同じプラスミドでも「上の相手との境界」と「下の相手との
+境界」が一致しない (実測 26423×17554 は reference 3 ブロック / query 2 ブロック)。
+1 本の線を両方の意味に見せないよう、**その帯に面した側にだけはみ出させる**
+(上のバーの下端 / 下のバーの上端)。バーは縦断させること — 縁だけに立てると
+プラスミド上のどこかが読めない。色と破線はペア表示と同一 (`#7c3aed`)。
+1 組も取れていなければトグルを無効化し理由を出す (**「未計算」を「差が無い」に
+見せない** — #40)。
+
+**行ラベルの高さをバーの高さで決めないこと。** 2 行 (名前 + DCJ/共有) あるのに
+`height: BAR_H + 10` にしていたため 2 行目が半分に切れていた。行間
+(BAR_H + RIBBON_H = 75px) に収まっていれば隣とは重ならない。
+
+**同席で直した二重化**: 一致率の凡例 `IdentityBar` がペア表示とスタック表示に
+手で複製されており、**バーの幅だけが 56px と 48px で食い違っていた**。
+`PlasmidStructureChrome.tsx` (旧 `PlasmidStructureModeSwitch.tsx`) に集約した。
+モード切替も同じ理由でここに置く — 複製するとモードが増えたとき片方だけ増えて
+「そのモードに行けない画面」ができる。
+
+**該当ファイル**: `workflow/scripts/compare_plasmid_structure.py`
+(`CHAIN_SCHEMA`, `MAX_CHAIN_TRACKS`, `apply_ref_frame_to_hsp`,
+`compare(reference_frame=)`, `compare_chain`, CLI の `--chain`),
+`workflow/tests/test_compare_plasmid_structure.py`,
+`api/services/result_parser.py` (`get_plasmid_structure_comparison(chain=)`),
+`api/routers/results.py` (`chain` クエリ引数),
+`frontend/src/lib/api.ts` (`PlasmidStructureChain` 型 / `fetchPlasmidStructureChain`),
+`frontend/src/components/PlasmidStructureChain.tsx` (新規),
+`frontend/src/components/PlasmidStructureChrome.tsx` (新規・共有 UI 部品),
+`frontend/src/components/PlasmidProfileSection.tsx` (並び順の状態と全ペア DCJ)
+
 ### 43. 検体メタデータに地域 (国 / 都道府県) と施設を追加した
 **動機**: 距離マップ (#41) は菌種と分離日しか軸を持たず、**「同じプラスミドが
 どこまで広がったか」= 施設間・地域間の伝播が読めなかった**。院内 1 施設の群では
