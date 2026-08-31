@@ -1474,3 +1474,162 @@ blaIMP-1 / blaIMP-6 / blaIMP-11 / blaNDM-5)。
 (`summary_row.py` は 17 KB なので既存経路はそのままでよい)。
 **blastn の探索パスにユーザー名を決め打ちしないこと** — アカウント制のワーカーは
 mbuser とは限らない。`_build_remote_command` の conda_init と同じ prefix 列を使う (#1)。
+
+### 42.1 on-demand のプラスミドクラスタリングは強制再実行しないと空振りする
+**症状 (実測 2026-08-31, toho_micro_id)**: 「プラスミド関連性 (クラスタ / DCJ MST /
+Outbreak)」が全検体で消え、Results から「解析を実行」を押しても直らない。
+ボタンは 202 を返し、実行ステータスも **completed になる**。
+
+**原因は 2 段**:
+1. **ジョブ完了後の自動フォローアップが、そのジョブの検体だけでクラスタリングして
+   グループ全体の成果物を上書きする。** 4 検体のジョブの後、
+   `plasmid_clusters_merged.json` が `num_plasmids: 9 / num_samples: 4` になり、
+   **全 76 検体の `sample_plasmid_clusters.json` が `num_plasmids: 0` で上書き**
+   された (#42 の「最後の実行で丸ごと上書きされる」がそのまま被害として出た形)。
+2. **その状態から on-demand で回しても何も起きない。** `_build_plasmid_cluster_cmd`
+   のターゲットは `plasmid_clusters/.done` で、workdir はジョブごとに新規 =
+   snakemake のメタデータが無く**判定は mtime だけ**。前回の出力が残っているので
+   「作るものが無い」となり **1 秒で終了**する。しかも最後に `.done` だけは更新
+   されるため、`.done` の鮮度で完了を見る API 側は**成功と判定する** (#36 と同型)。
+   痕跡の見分け方: `decision.json` の mtime が更新されていない = ルールが 1 つも
+   走っていない。
+
+**対処**: on-demand 経路 (`session is not None` = ボタン / API から明示実行) のみ
+`--forcerun <クラスタリング系ルール>` を付ける。**`--forceall` にしないこと** —
+`--allowed-rules` で終端入力として扱っている per-sample 成果物まで作り直そうとして
+DAG が壊れる。自動フォローアップ (`session=None`) は従来どおり forcerun しない。
+
+**未対処 (ユーザー決定 2026-08-31: 現状維持)**: 自動フォローアップを常にグループ
+全体で回す案は採らなかった (毎ジョブの最後に 10〜20 分かかり、検体が増えるほど
+延びるため)。したがって**新しい検体を投入するたびにグループ全体の関連性は
+上書きされ、都度ボタンで復旧する運用**になる。
+
+#### 続報: 「pling 完了直後に消える」の真因は**試行の重なり** (2026-08-31 確定)
+強制再実行を入れて実行が 6 分級になった途端、**pling が exit=0 を書いた直後に
+snakemake ごと消える**症状が 2 回再現した。ワーカーの snakemake ログは
+`run_pling` のシェルを表示した行で終わり、**エラーも中断メッセージも残らない**。
+- **カーネルは無関係**: `dmesg -T` に OOM も kill も無く、WSL VM は無停止
+  (uptime 4 日)、RAM 216 GB。`mini_init drop_caches` は実行**後**の回収で結果側。
+- **真因**: 1 ジョブの中で attempt 1〜3 が**重なって走っていた**。実測
+  `plasmid_cluster_20260831_110512_877f70`: a1 11:05:16 起動 (11:10 まで生存) /
+  a2 11:10:07 / a3 11:10:20。pling.log の `Batching 11:10:22` と a3 の
+  snakemake ログ (11:10:22, 11:14:41) が 1 秒単位で一致し、**pling を回したのは
+  a3**、a2 はその 13 秒前に同じ出力先へ入っていた。
+- **壊し方**: `run_pling` は起動時に**共有の NAS 出力先を `rm -rf`** していた。
+  後から入った実行が先行の pling 出力をディレクトリごと消すため、先行側は
+  完了処理 (`pling/.done` と `.snakemake_timestamp` の作成) に到達できない。
+  `pling/.done` が無いので次回も pling をやり直す、という悪循環になる。
+- **なぜ重なったか**: 監視ストリームが先に切れて `exit=None` になり、PGID も
+  取り逃がすと `_pgid_alive` が「死んだ」と判断して再投入する。**PGID だけを
+  生存確認の根拠にしてはいけない。**
+**対処 (実装済み)**:
+1. 再投入の前に `pgrep -f 'snakemake.*{nas}/plasmid_clusters/.done'` で
+   **出力先を掴んでいる snakemake を探す** (`_cluster_snakemake_running`)。
+   居れば再投入せず待つ。**確認に失敗したときは「走っている」に倒す**
+   (重ねるより待つほうが安全)。照合は必ずグループ固有のフルパスで行うこと —
+   汎用語で撃つと無関係なジョブに当たる (#36.1)。
+2. `run_pling` は**専用の一時ディレクトリで走らせ、成功したときだけ `mv` で
+   差し替える**。共有の出力先をその場で消さない。後片付けは `$$` 付きの
+   自分の一時ディレクトリだけを消す (**glob で消すと並走中の別実行を巻き込む**)。
+3. 試行ごとに workdir を分ける (前掲) — ただしこれだけでは**NAS 出力先の共有**は
+   解決しないので、1 と 2 が本体。
+**該当ファイル**: `api/services/snakemake_runner.py`
+(`_run_plasmid_cluster_batch`, `_build_plasmid_cluster_cmd(force=)`)
+
+### 42.2 DB に置いた FASTA はヘッダが削れている — 環状情報を検体側から補う
+**症状 (実測 2026-08-31)**: 26424__AA739 × 19397__AA739 の構造比較が
+**全面的に交差した X 字**になり、「原点合わせ」を入れても直らない
+(反転 381,493 bp / 共線性 0%)。同一クラスタの同じプラスミドなのに構造差が読めない。
+**原因**: `estimate_frame` が枠を当てるのを諦めていた
+(`frame.reason = "not_circular"`)。query 側 `db/plasmid_outbreak/by_cluster/
+AA739/19397__AA739.fasta` のヘッダが **`>contig_2` だけ**で、環状かどうかも
+`rotated_gene` も失われていたため。**実測で DB 159 本中 52 本 (33%)** が同じ状態
+(古い版で登録されたもの)。`meta.json` の `circular` も `null`。
+**ところが検体側には残っている** — `results/19397/mob_suite/mob_suite_result.json`
+の contig レポートに `contig_2_length:369003_cov:114_circular rotated=True
+rotated_gene=repA` がそのまま入っていた。
+**直したこと**:
+- `read_plasmid_index` の `circular` を **三値 (True / False / None=不明)** に。
+  ヘッダに `_circular` も `_linear` も無いものを False に潰していたのが
+  「直線だから原点を合わせない」という**誤った断定**になっていた (#28 と同型)。
+- `fill_contig_flags()` で、不明のときだけ MOB-suite の記録から補う
+  (**ヘッダにあるなら上書きしない**。出所は `circular_source` に残す)。
+  特徴量 (AMR/rep/MGE) を読むのと同じ `results_dir` 経路なので新しい依存は無い。
+- **回転と反転を分ける。** 回転 (原点ずらし) は環にしか意味が無いが、**反転は
+  鎖の向きの取り替えなので直線でも定義できる**。環状と確認できない query でも
+  反転だけは当て、`frame.reason="reverse_only_not_circular"` で何を当てたかを言う。
+  UI も「原点を 0 bp ずらした」ではなく「向きだけ合わせた」と書き分ける。
+**効果 (同一ペアの実測)**: 枠なし=共線性 0% → 反転のみ=**84%** →
+反転+原点 45,223 bp=**92%**。図が対角線に乗り、残る 10,988 bp の反転区間
+(本物の構造差) だけが逆向きに見える。
+**キャッシュに注意**: `_structure_cache/` のキーは閾値と schema だけを見ており、
+**判定ロジックを直しても古い図を返し続ける**。算出ロジック専用の
+`LOGIC_VERSION` をキーに含めた。**判定を変えたら必ず上げること。**
+**該当ファイル**: `workflow/scripts/compare_plasmid_structure.py`
+(`read_plasmid_index` の三値化, `mob_contig_flags`, `fill_contig_flags`,
+`estimate_frame`, `LOGIC_VERSION`), `workflow/tests/test_compare_plasmid_structure.py`,
+`frontend/src/components/PlasmidStructureCompare.tsx` (枠の説明文),
+`frontend/src/lib/api.ts` (`circular: boolean | null`)
+
+### 43. 検体メタデータに地域 (国 / 都道府県) と施設を追加した
+**動機**: 距離マップ (#41) は菌種と分離日しか軸を持たず、**「同じプラスミドが
+どこまで広がったか」= 施設間・地域間の伝播が読めなかった**。院内 1 施設の群では
+菌種軸も分離年軸も無地になる。分離日と同じ `sample_metadata` に相乗りさせる。
+
+**表現方法 (自由テキスト 1 列にしない理由)**: 色分けと集計には**キー**が要る。
+`東京` / `東京都` / `Tokyo` が別カテゴリになった時点で地域軸は意味を失う。
+一方コードだけだと海外の未収載地域を表現できない。よって 3 列に分ける:
+`country` (ISO 3166-1 alpha-2) + `region_code` (ISO 3166-2。**日本のみ**) +
+`region_label` (表示ラベル。海外は自由入力のまま)。施設 (`facility`) は自由入力。
+- **海外**: ISO 3166-2 の全世界テーブル (約 5,000 行) は同梱・保守しない。
+  国は 249 件を全て持ち、**日本以外の第一次行政区画は自由入力**として
+  `region_code=None` で保持する。GISAID / Nextstrain も Country / Division の
+  自由記述で回っている。**alpha-3 (JPN) は受け付けない** — 変換表を別に抱えると
+  誤りの温床になる。
+- **正規化は `api/services/geography.py` だけが行う** (#19 の二重化事故の再発防止)。
+  API は `region_key` / `region_display` / `facility_key` を**計算済みで**返し、
+  frontend はそれで束ねて描くだけ。**フロントで正規化し直さないこと。**
+- 集計キーは `region_code` → 無ければ `国:正規化ラベル` → それも無ければ `国`。
+  **国だけ分かっている検体は国で束ねる** (分かっている情報を「未登録」に落とさない)。
+  `_norm()` はアクセントを落とす (`Hyōgo`→`Hyogo`) が**かなの濁点は残す**
+  (ハ ≠ バ)。
+
+**踏んだ / 塞いだ点**:
+- **既存 DB には列が入らない。** スキームは `CREATE TABLE IF NOT EXISTS` だけで
+  移行機構が無かった。`PRAGMA table_info` を見て不足列だけ `ALTER TABLE ADD COLUMN`
+  する `_migrate()` を追加 (冪等)。実データ 259 行 (kaoki_stec) は無傷。
+- **`set_sample_isolation_date(None)` は行ごと DELETE していた。** 地域・施設が
+  入った後にこれをやると巻き添えで消える。`upsert_sample_metadata(fields)` の
+  部分更新に作り替え、**全項目が空になったときだけ**行を消す。`order_index`
+  (同一分離日内の序列 = cgSNP の木の顔ぶれ) は必ず保つ。
+- **CSV の空欄は「解除」ではなく「変更しない」。** 一括取り込みの空セルで既存の
+  分離日や施設名が消えると被害が大きく、しかも気づきにくい。解除は UI から 1 件ずつ。
+- **半分だけ取り込まない。** 日付や国名が解釈できない行は丸ごと飛ばす
+  (どこまで入ったか後から分からなくなる)。**分離日の列は必須ではない**
+  (地域・施設だけの表を受け付ける)。日付を持たない行は `order_index` を動かさない。
+- **地域が空なら国も保存しない** (編集ダイアログ)。国だけ残すと地域軸に「日本」の
+  1 カテゴリが立ち、分離日しか登録していない検体まで「地域 登録済み」に見える。
+- **ワーカーへは配らない。** `db/isolation_dates.json` は cgSNP の並べ替え専用で、
+  地域・施設は使わない。**NAS 上の共有 JSON に書き手を増やさない** (#25)。
+  分離日を触ったときだけ再配布する。
+- **未登録と取得失敗を書き分ける** (#28 / #40)。`epi_metadata_status` を返し、
+  UI は「未登録」「取得失敗」を別の文言で出す。実データは地域・施設が 0 件なので、
+  **無地に落ちない**ことを検証済み (既定軸は菌種のまま、表は「未登録」)。
+- 色分けの既定軸は 菌種(≥2) → **地域(≥2)** → 分離年(≥2) → 出所。**施設は既定に
+  しない** (院内 1 施設だと無地)。カテゴリ色は #41 と同じ **3 色 + その他 + 不明**
+  の規則を `categoricalScheme()` 1 箇所に集約した (4 色目は CVD 検証を通らない)。
+- **施設をまたぐエッジは菌種横断と同格**で出す (ツールチップ + サマリの警告)。
+  「未登録 ↔ 何か」は**またぐと言わない** (不明は相違ではない)。
+**プライバシー**: 施設名 + 分離日 + 菌種が揃うと症例が特定されうる。DB は
+グループ scope で分離済みだが、**距離マップを HTML エクスポートに載せるなら
+マスク切替を先に決めること** (現状エクスポートは距離マップを出力していない)。
+**該当ファイル**: `api/services/geography.py` (新規・単一の真実源),
+`api/services/sample_metadata.py` (`isolation_dates.py` から改名),
+`api/services/account_store.py` (`_migrate`, `upsert_sample_metadata`),
+`api/routers/results.py` (`_decorate_meta`, `GET /geography`,
+`PUT /samples/{sample}/metadata`, 距離マップのノード付与),
+`api/tests/test_geography.py` / `api/tests/test_sample_metadata_import.py` (新規),
+`frontend/src/components/PlasmidDistanceMap.tsx` (`categoricalScheme`, 地域/施設軸),
+`frontend/src/components/SampleMetadataDialog.tsx` (新規),
+`frontend/src/components/SampleMetadataImportDialog.tsx` (`IsolationDateImportDialog`
+から改名), `frontend/src/pages/Results.tsx`, `frontend/src/lib/api.ts`
