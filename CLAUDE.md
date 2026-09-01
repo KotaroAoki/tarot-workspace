@@ -1716,3 +1716,72 @@ rotated_gene=repA` がそのまま入っていた。
 `frontend/src/components/SampleMetadataDialog.tsx` (新規),
 `frontend/src/components/SampleMetadataImportDialog.tsx` (`IsolationDateImportDialog`
 から改名), `frontend/src/pages/Results.tsx`, `frontend/src/lib/api.ts`
+
+### 44. 距離マップの表示制御 (個別の非表示 + 一括絞り込み)
+**動機**: Genetic Distance Map (DCJ-Indel MST) は `data.nodes` を常に全件描いており、
+絞り込みは中心プラスミドの選択と表示範囲 (cluster/community) しか無かった。
+184 ノードの群では図が読めず、「この地域だけ」「carbapenemase 保有だけ」で
+見たいという要求に応えられない。メンバー一覧のチェックボックス (個別) と
+条件による一括絞り込みの 2 層を入れた。
+
+**MST は表示中のノードだけで張り直すこと。** 元の MST から該当ノードだけ消すと、
+**隠したノードを経由していた枝が残って実在しない直接の隣接に見える**。
+`computeMst(visibleNodes, data.edges, center)` と絞った集合を渡せばよい
+(エッジの DCJ 値は全ペアが `data.edges` にあるので値は変わらない)。
+`computeMst` は adjacency を `nodes` から作るので、**両端が表示中のエッジしか
+返さない**ことが構造的に保証される。
+
+**中心プラスミドは条件に関わらず常に表示する。** 外すと Prim の開始ノードが集合の
+外に出て `adj.get(startId)` が空になり、**枝が 1 本も引けず全ノードが孤立する**。
+中心が条件に合っていないとき (carbapenemase 非保有のプラスミドを中心に「保有のみ」で
+絞った等) は、その旨をバッジに明示する。
+
+**一括絞り込みは個別の非表示 (`hidden`) とは別レイヤーで宣言的に持つこと。**
+materialize して `hidden` に流し込むと「なぜ消えているのか」が後から言えなくなり、
+条件だけを解除することもできない。`filters[軸] = 除外するキーの集合` とし、
+**包含ではなく除外**で持つ (包含集合だと後から増えたカテゴリが既定で隠れる)。
+- 絞り込みで外れた行の個別チェックボックスは**無効化して理由を出す**。
+  押しても戻らない操作を黙って置かない (#36 と同じ趣旨)。
+- **見えない条件を作らない。** カテゴリの軸は「色分け」の選択に従わせた
+  (軸セレクタを 2 つ置くとどちらが図の色を決めているのか読めなくなる) が、
+  他の軸で掛けた条件は保持されるので「他の軸でも絞り込み中: 菌種 1 件除外」と
+  必ず文字で出す。
+- バッジは内訳で出す (`12 個を非表示中 (絞り込み 9 · 個別 3)`)。
+  非表示の行は**表から消さない** (消すと戻せない)。
+
+**色の割り当ては全メンバーで決め、件数と凡例は表示中を数える。** 表示中だけで
+順位を付け直すと 1 個外すたびに 3 色が入れ替わって図が読めなくなる。逆に凡例の数が
+非表示のぶんまで数えていると図と食い違う。分離年ランプも**範囲は全件で固定**
+(同じ色が別の年を指すことになるため)。絞り込みチップの件数だけは全件基準にする
+(戻したら何個増えるかが読めるように)。
+
+**軸の key/label は `AXES` に集約した。** 従来 `buildColorScheme` と直接ラベル生成の
+2 か所に複製されており、絞り込みが 3 つ目の複製になるところだった。キーの決め方が
+分かれると「色は塗り分かるのに絞り込みが効かない」という食い違いが出る (#19)。
+`region_key` / `facility_key` は API 側で正規化済みなので**フロントで作り直さないこと**。
+
+**踏んだ罠 — フックの宣言順 (TDZ) は tsc が捕まえない。** 絞り込みブロックを
+`const [colorMode] = useState(autoMode)` より前に置いたため、実機で
+`ReferenceError: Cannot access 'colorMode' before initialization` になった。
+参照がすべて**クロージャの中** (`useMemo` のコールバックや `.filter(m => ...)`) に
+あるので型としては合法で、`tsc --noEmit` は通る。**型チェックの通過を動作確認の
+代わりにしないこと。**
+
+**検証は `react-dom/server` でできる (jsdom もテストランナーも不要)。**
+`vite build --ssr` で一時エントリを束ねて node で走らせれば、**レンダー本体は
+実行される** = TDZ を含むレンダー時例外を捕まえられる (effect は走らないので
+d3 と ResizeObserver は無関係)。`useSampleAliases` は `useSyncExternalStore` に
+`getServerSnapshot` を渡しているので SSR で落ちない。**出力先をプロジェクト外に
+すると `react-dom` が解決できない** (ESM の解決はファイル位置基準) ので、
+出力はリポジトリ内に置いて後で消すこと。合成データはメタデータ皆無・取得失敗の
+ケースも通すこと。
+
+**同席で直した既存バグ**: エッジのクリックから構造比較を開く経路が
+`d.source as string` を渡していた。`simLinks` は作成時点で既に `nodeMap` 経由の
+**SimNode オブジェクト**を入れているので、キャストしても uid にはならず
+`onCompare` に不正な値が渡っていた (ノードクリック経路は元から正しい)。
+`(d.source as SimNode).plasmid_uid` を渡すよう修正。
+**該当ファイル**: `frontend/src/components/PlasmidDistanceMap.tsx`
+(`AXES`, `UNKNOWN_KEY`, `hidden` / `toggleHidden`, `filters` / `carbaOnly` /
+`matchesFilters` / `isVisible`, `facets` / `toggleFacet`, `categoricalScheme(shownNodes)`,
+`buildColorScheme(shownNodes)`)
