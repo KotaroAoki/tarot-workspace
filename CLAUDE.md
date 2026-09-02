@@ -1889,3 +1889,63 @@ VirulenceFinder 21,886 件・VFDB 128,089 件すべてで長さが求まるこ�
 `frontend/src/components/PlasmidDistanceMap.tsx`,
 `frontend/src/components/PlasmidProfileSection.tsx`,
 `frontend/src/pages/SampleDetail.tsx`, `frontend/src/index.css`
+
+### 47. 参照ゲノムを補充した検体の cgSNP 再実行が再アセンブリを引き起こしていた
+**背景**: 参照が無くて skip された検体 (`mapping.done` に
+`SKIPPED: no reference genome for {species} ST{st}`) は、参照を補充した後に
+Results から「Core SNP を実行」を押すと **flye_assembly まで遡って再解析**された。
+`_run_core_snp_batch` の `phylo_only` ガード (`_core_snp_mapping_ready`) が
+`SKIPPED` / `FAILED` を「未完了」の一言で括り、**ルール制限なしの通常実行**に
+落としていたため。NAS の `input/contigs.fasta` は壊れたシンボリックリンク (#17)
+なので、素直にターゲットを要求すると snakemake が `validate_fasta` を
+「出力が無い」と判断して上流へ遡る (実測 2026-08-04: 10 検体で 80〜120 分、
+しかも BAM が新しい乱数で作り直されて他検体の系統樹が陳腐化した)。
+ガード自体がこの事故を防ぐために入っていたのに、**参照補充という
+「まさに再実行したい状況」だけが穴から漏れていた**。
+
+**解決 = 2 値のガードを 3 値の仕分けにする** (`_core_snp_stage_plan`)。
+| 状態 | 条件 | 実行 |
+|---|---|---|
+| `done` | `mapping.done` が `DONE` | `--allowed-rules core_snp_phylo` (従来と同一。BAM 不変) |
+| `redo` | 未実行 / `SKIPPED` / `FAILED` **かつ** core_snp_map の入力が揃っている | `--allowed-rules core_snp_map core_snp_phylo` で**上流を終端入力として扱う** |
+| `blocked` | core_snp_map の入力が欠けている | 従来どおりルール制限なし (本当に上流から作る必要がある) |
+
+**`done` と `redo` を同じ snakemake 実行に混ぜてはいけない。**
+`core_snp_map` を許可した時点で done 済み検体も対象になり、
+**`--rerun-triggers mtime` では守れない** — 実測 2026-09-02 (NAS 全 8 アカウント):
+done 済み 739 件のうち **642 件 (87%)** で入力が `mapping.done` より新しく、
+最大 12 日ずれていた (後続の on-demand 実行が `input_class.json` を書き直すため)。
+よって段階を分けて別々の snakemake 実行にする。
+
+**段階の順序が意味を持つ**: `BAM 作成 (redo)` → `系統解析 (redo + done)` →
+`通常実行 (blocked)`。マッピングを先に終わらせないと、系統樹が
+「まだ登録されていない株」を見落とす (実測 2026-09-02: 2 検体を 1 回の実行で
+回すと片方の phylo がもう片方の map より先に走り BAM 1 本で `insufficient`)。
+**段階の失敗はバッチ全体の中止にしない** — 失敗した段階の検体だけを
+`dropped` に入れて後段から外す (BAM 作成が失敗しても、既にマッピング済みだった
+検体の系統樹は作れる)。
+
+**切断復帰の判定に鮮度を持たせること** (`_await_core_snp_completion(newer_than=)`)。
+再実行では成果物が前回実行から**既に存在する**ので、存在だけを見ると切断直後に
+「もう完了している」と誤判定する。参照補充後の再実行では `mapping_info.json` に
+前回の `status=skipped` が残っており、これを完了と読むと**マッピング中に
+系統樹の段階へ進む**。段階開始時のリモート時刻 (`date +%s`) を基準に mtime で
+弾く。段階ごとに待つ成果物も違う (`mapping_info.json` / `core_snp_result.json`)
+ので `result_rel` で渡す。
+
+**core_snp_map の入力一覧は config から引く** (`_core_snp_map_input_paths`)。
+サブタイプの元データ (E. coli なら fimtyper) は `config.core_snp.subtyping` に
+書かれており、workflow 側の `_core_snp_subtype_inputs` と**同じ config を読む**
+ので判定ロジックを API に複製しない (#19)。判定に失敗したら `blocked`
+(= 従来の挙動) に倒す。
+
+**残る挙動 (許容)**: 参照がまだ無い検体でボタンを押すと `redo` に入り、
+`run_core_snp_map.py` は **Phase 1-4 (fastplong → DeChat → wgsim) を終えてから
+Phase 6 で参照を探す**ので、約 13 分かけて再び `SKIPPED` を書く。
+以前の 80〜120 分の再アセンブリよりは大幅に軽い。短絡させるには API 側で
+species_dir / ST の解決を複製することになるので採らない。
+
+**該当ファイル**: `api/services/snakemake_runner.py`
+(`_CORE_SNP_MAP_INPUTS`, `_core_snp_map_input_paths`, `_core_snp_stage_plan`,
+`_run_core_snp_batch` の段階実行, `_await_core_snp_completion(result_rel=, newer_than=)`),
+`api/tests/test_core_snp_stage_plan.py` (新規)
