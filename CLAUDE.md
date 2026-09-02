@@ -1785,3 +1785,107 @@ d3 と ResizeObserver は無関係)。`useSampleAliases` は `useSyncExternalSto
 (`AXES`, `UNKNOWN_KEY`, `hidden` / `toggleHidden`, `filters` / `carbaOnly` /
 `matchesFilters` / `isVisible`, `facets` / `toggleFacet`, `categoricalScheme(shownNodes)`,
 `buildColorScheme(shownNodes)`)
+
+### 45. 図と表の UI で踏んだもの (ツールチップ / 当たり判定 / 同色 / ソート)
+2026-09-02 の一連の修正。**どれも「エラーも出ず、ただ何も起きない」形**で表面化した。
+
+#### 45.1 `position: fixed` のツールチップに `d3.pointer(event, document.body)` を使わない
+**症状**: 距離マップでもゲノムマップでも、ノード・遺伝子にマウスを乗せても
+**何も出ない**。コンソールにも何も出ない。
+**原因**: ツールチップは `position: fixed` で置いているのに、位置を
+`d3.pointer(event, document.body)` から取っていた。あれが返すのは**ページ座標**
+(body の `getBoundingClientRect().top` がスクロール量ぶん負になるので
+`clientY + scrollY` になる)。`fixed` はビューポート基準なので、その差だけ下に
+ずれて**画面外に描かれる**。実測 (実ブラウザ, 2026-09-02): `scrollY=1200` のとき
+`clientY=400` に対して `d3.pointer` は `1600` を返す = ちょうど 1200px 下。
+**SampleDetail のプラスミド欄とゲノムマップはページのかなり下にあるため、
+実質いつでもこの状態**だった。
+**方針**: `lib/tooltipPosition.ts` に集約し `clientX/clientY` を使う。
+ビューポート右端・下端で切れないよう寄せる。
+**`position: absolute` でコンテナ基準に置く場合は話が別**で、
+`d3.pointer(event, containerRef.current)` が正しい (`GfaGraph.tsx` がその形。
+こちらは正常なので触っていない)。**混ぜないこと。**
+
+#### 45.2 見えている ≠ 狙える — 当たり判定は実測すること
+座標を直しても出なかった。実測すると**線形レーンの遺伝子 `rect` は `width="2"`**。
+5 Mb の contig を約 760px に写すので 1 kb の遺伝子は 0.15px になり、
+`Math.max(2, ...)` の下限で 2px に潰れる。円形のアークも 12×6px しかない。
+**方針**: 透明な当たり判定層を**最前面**に重ねる (線形は中心を保ったまま最小 10px、
+円形は最小 3.4° + 内外に余白)。**見た目は一切変えない。**
+- **ハンドラは見えている図形ではなく親の `g` に付ける。** carbapenemase の
+  ハロー (`fill: none` + stroke) は `pointer-events` を切っていないので、芯の円に
+  付けているとリング上でイベントを奪われる。`g` なら子からバブルで拾える。
+- 当たり判定層より**後に**描くラベル文字には `pointer-events: none` を付ける。
+- **`mousemove` で `html: ''` を渡さないこと。** `mouseenter` は既に発火済みなので、
+  動かした瞬間に中身が消えて黒い箱だけが残る (円形マップで実際に起きていた)。
+
+#### 45.3 色が被ったら「色を変える」より「レーンを見せる」
+`classColor` の `other` は `#64748b`、`mgeColor` の `other` は `#94a3b8`、
+さらに **`mgeColor` の `cn` は `#64748b` = AMR other と完全に同一**。marks の色だけでは
+内側 (AMR) と外側 (MGE) のどちらのトラックか読めない。
+**方針**: 色は変えず、**トラックに下地の帯**を敷く (内側=寒色 `#e6edf5` /
+外側=暖色 `#f6efe4`)。既存の実線リング・バーが境界であることを明確にし、
+MGE トラックの外縁は破線で閉じる。円の中心・左ラベル (`AMR: 3 (内側)`)・
+セクション凡例の 3 か所に配置を明記する。帯には `pointer-events: none` を付けて
+45.2 の当たり判定を塞がないこと。
+
+#### 45.4 ソートキーに素の `Number()` を使わない
+**`Number(null)` も `Number('')` も `0`** (NaN ではない)。ソートキーをそのまま
+`Number(row.identity)` にすると、**値が無い行が「0%」「0 bp」として先頭に並ぶ**。
+`numOrNaN()` で NaN に落として `sortRows` の空値扱い (昇順・降順とも末尾) に乗せる。
+空値を最小値として先頭に置くと、値のある行が押し下げられて読めなくなる。
+**ソート部品は `lib/tableSort.ts` (純関数) と `components/SortHeader.tsx`
+(見出し UI) に集約した。** 表ごとに複製すると、トグルの向き・空値の寄せ方・
+矢印の見た目がずれる。**ファイルを分けてあるのは
+`react-refresh/only-export-components` を避けるため** (コンポーネントと純関数を
+同じファイルから export すると警告になる)。
+
+#### 45.5 カード内テーブルの固定表示
+`.table-wrapper--sticky-card` (高さ 320px) + `.table--sticky` + 先頭列に
+`.col-sticky-first`。**Results の Sample 表 (`.col-check` + `.col-sample`) とは
+クラスを分ける** — あちらは列構成が固定で left オフセットが噛み合っている。
+- **ヘッダの塗りは `thead` ではなく `th` に置く。** sticky 化すると `thead` 要素の
+  背景はセルと一緒に動かない。MEFinder は `thead` にインラインで
+  `var(--color-bg)` を置いており、`th` 自体は透明なので、**色を比べるときは
+  `thead` 側を見ること** (`th` の computed は `rgba(0,0,0,0)` になる)。
+- 固定列との**交差セル (ヘッダの先頭列) も同じ塗り**にする。忘れるとヘッダ行の
+  左端だけ色が変わる。本文側の固定列は行と同じ `--color-surface` でよい。
+- カード単位でヘッダ塗りを当てる `.table-heads--fill` を用意した (AMR Gene Profile
+  のようにカード内に表が 4 つあると、表ごとの指定は付け忘れる)。
+- 横スクロールを意味あるものにするには表に `min-width` が要る
+  (`table { width: 100% }` のままだと決して溢れない)。
+
+#### 45.6 検証: props だけで動くコンポーネントはログイン不要で実ブラウザ検証できる
+このアプリは SSH 資格情報でログインしないと画面が出ないが、`GenomeMap` のように
+**props だけで動くコンポーネントは一時ハーネスで直接叩ける**。Vite dev サーバは
+任意の `.html` を配信するので、`frontend/__harness.html` + `src/__harness.tsx` を
+置いて `http://localhost:3000/__harness.html` を開くだけでよい (確認後に削除)。
+- **`react-dom/server` ではレンダー本体しか実行されない** (#44 で TDZ を捕まえた
+  方法)。d3 の描画・イベント・sticky は effect と実 DOM が要るので**捕まえられない**。
+  この層はハーネスで見ること。
+- **目視で終わらせない。** DOM を実測する — arc の半径 (`getBBox` の中心から距離)、
+  当たり判定 `rect` の `width`、固定列の左端とラッパー左端の差、
+  `getComputedStyle` の `position` / `backgroundColor` / `zIndex`、
+  見出しを `click()` して並び順。実際、当たり判定 2px も `Number(null)===0` も
+  この実測で見つかった。
+- ハーネスのヘルパを本番と別に書くと、**本番には無いバグを見て別の結論を出す**
+  (`hitLengthNum` を簡略化したせいで存在しない挙動を一度追いかけた)。
+  ハーネスは本番の関数を import するか、同じ実装をコピーすること (#38 と同型)。
+- 合成データはメタデータ皆無・取得失敗・欠損値のケースも通すこと。
+- **フィルタを通したデータを渡すこと。** `GenomeMap` は
+  `enabledClasses.has(canonicalClass(...))` で絞るので、生の class 名で
+  `enabledClasses` を作ると**何も描かれない**。
+
+#### 45.7 モジュールごとに「長さ」の出所が違う
+Virulence Genes 表に Length を足すとき、VirulenceFinder は `position` の
+`"a..b"`、VFDB (ABRicate) は `start`/`end` (**文字列で来る**)。VirulenceFinder の
+`coverage` は `"1656 / 1656"` = Query / Template length で、`position` が無いときの
+控えに使える。`hitLength()` に集約し、**NAS の全レポート 825 件に当てて
+VirulenceFinder 21,886 件・VFDB 128,089 件すべてで長さが求まることを確認**した。
+長さを持たない行は `-`。**0 を出さないこと** (「長さ 0」と読める)。
+**該当ファイル**: `frontend/src/lib/tooltipPosition.ts` (新規),
+`frontend/src/lib/tableSort.ts` (新規), `frontend/src/components/SortHeader.tsx` (新規),
+`frontend/src/components/GenomeMap.tsx`, `frontend/src/components/GenomeMapSection.tsx`,
+`frontend/src/components/PlasmidDistanceMap.tsx`,
+`frontend/src/components/PlasmidProfileSection.tsx`,
+`frontend/src/pages/SampleDetail.tsx`, `frontend/src/index.css`
