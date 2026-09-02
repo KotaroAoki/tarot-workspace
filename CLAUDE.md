@@ -1890,6 +1890,176 @@ VirulenceFinder 21,886 件・VFDB 128,089 件すべてで長さが求まるこ�
 `frontend/src/components/PlasmidProfileSection.tsx`,
 `frontend/src/pages/SampleDetail.tsx`, `frontend/src/index.css`
 
+### 46. クラス 1 インテグロンの検出と描画 (層 A = 骨格マーカー blastn)
+**動機**: `intI1` を見ているモジュールが**一つも無かった**。MEFinder は 28,479
+エレメント / 名前 2,053 種にインテグロンを 1 件も含まず (DB に無い)、ABRicate 5 DB
+(vfdb/megares/card/ncbi/resfinder) も 16,204 ヒットで `intI` ゼロ、AMRFinderPlus も
+`intI1` を持たない (耐性遺伝子ではないため)。一方 AMRFinder は 3'-CS の
+`qacEΔ1`+`sul1` を **174 / 825 検体 (21%)** で検出しており、
+**陽性検体が 174 件あるのに UI のどこにも出ていなかった**。
+
+**PlasAnn は使えない (使わない)**。PlasAnn だけが `intI1` ("class 1 integron
+integrase IntI1", 1,014 bp) と `attI` を検出できるが、`toho_micro_id` で
+3'-CS 陽性 75/76 に対し **intI1 を拾えたのは 22 検体だけ**。理由は 3 つ:
+① プラスミドユニットしか見ない (`molecule_classification` がある検体で数えると
+**クラス 1 陽性の約 18% は染色体性**)、② 座標がプラスミド単位 FASTA 上 (#42)、
+③ レポート JSON の `features` が名前順 500 件で切られる (#21 と同型)。
+→ **補強証拠 (`supporting.plasann`) としてのみ記録し、判定材料にしない。**
+
+**設計**: 判定は `workflow/scripts/classify_integron.py` **のみ**が行い
+`integron/integron_result.json` とレポートの `integrons` セクションに焼き込む。
+frontend (`IntegronCard` / `GenomeMap`) も `htmlExport` も読むだけ (#19)。
+問いごとに真実源を 1 つに絞ってある:
+| 問い | 真実源 |
+|---|---|
+| 骨格 (intI1/2/3 · attI1 · 3'-CS · tni) の位置 | 本モジュールの blastn |
+| カセット遺伝子の名前と薬剤クラス | **AMRFinderPlus** |
+| 染色体/プラスミド・環状性 | **molecule_classification.json** |
+| 周辺の IS | **MEFinder** |
+| attC (将来) | IntegronFinder (層 B。未実行なら `analysis_level="marker"`) |
+
+**新規 conda env・DB ビルド不要**。`blastn -task blastn -subject` 方式
+(`screen_known_vectors.py` / `compare_plasmid_structure.py` と同じ) で
+**0.6 秒/検体**。参照は `workflow/resources/integron/` に**凍結**
+(`build_markers.py` が NCBI から取得。`workflow/resources/paidb/` と同じ前例で、
+`workflow/` は tar 同期されるので配布も自動)。
+
+**マーカーは構造要素だけに絞る (12 本)**: intI1 (AF071413.3 = Tn21 の In2) /
+intI2 (MW654184.1 = Tn7) / intI3 (D50438.1) / attI1 / qacEΔ1 / sul1 / orf5 /
+tniA・tniB・tniC・tniQ (GQ857074.1 = Tn402 型) / tniBΔ1。
+IS26・IS6100 は MEFinder が権威なので入れない。IRi/IRt (25 bp) は blastn の
+下限を割るので入れない。**カセット遺伝子も入れない** (AMRFinder が権威)。
+
+#### 実装で確定した閾値 — **すべて実測分布から決めた** (#38)
+- **クラス判定は同一性 ≥95% / 被覆 ≥90%**。intI1/intI2/intI3 の相互同一性は
+  **57.8〜66.2%** (局所アラインメント実測) で、実検体 19403 では intI1 99.9% に対し
+  intI3 が 65.2% で交差ヒットした。候補下限 80% で交差ヒットは自動的に落ちる。
+  同一性が足りないときは**クラスを断定せず `unknown`** にする。
+- **カセットは固定幅の窓ではなく「連鎖」で拾う。** 窓にすると attI1 直後の 1 個しか
+  入らない (カセットは骨格マーカーを持たないので窓が locus の端で切れる)。実測
+  harada_ndm 03_GD33 の有名な `estX-arr2-cmlA-blaOXA10-aadA1-dfrA14` 型が
+  **`intI1|arr-2` になっていた**。
+- **連鎖の間隔上限 1,200 bp**。NAS 全陽性検体で「1 つ前の要素との間隔」を集計した結果:
+
+  | 間隔 | 主な遺伝子 | 解釈 |
+  |---|---|---|
+  | 〜799 bp (n=1198) | blaIMP-1 / aac(6')-IIc / aadA / dfrA / cmlA / qacL | 真のカセット |
+  | 800–1199 bp (n=50) | **sul3 (26)** / qacL | sul3 型 3' 末端 |
+  | 1200–1999 bp (n=43) | **tet(A) 19 / mph(A) 11 / blaTEM-1 8** | インテグロン外 |
+
+  1,200 bp より先は Tn1721 の tet(A) や mphA-mrx といった「隣に居るだけの別の
+  耐性モジュール」になる。**この値を上げないこと。**
+- **負の間隔は正常** (実測 42 件)。先頭カセットの core site が attI1 マーカーと
+  数十 bp 重なる。`cassette_overlap_tolerance` 200 bp で許容する。
+- `distance_thresh` 4,000 bp (骨格を 1 locus にまとめる幅) は
+  **IntegronFinder の `--distance-thresh` 既定と同値**にしてある。
+
+#### 実データで分かったこと (誤読しやすいもの)
+- **`sul3` はカセットではなく 3' 末端**。`three_prime_cs.state` を
+  `classic` / `partial` / **`sul3-type`** / `absent` の 4 値で持つ。
+- **骨格断片をインテグロンとして数えない。** 実測 19400 の contig_7 は本体から
+  8 kb / 16 kb 離れた位置に `qacEΔ1+sul1` が 100% 同一性でもう 2 組ある
+  (Tn21 系モザイクでは 3'-CS の複数コピーが普通)。インテグラーゼもカセットも
+  伴わない locus は `orphan_elements` に**残して**別枠にする (#28: 落としたものは記録する)。
+  NAS 全体で 40 件。
+- **タンデム重複は実在する。** 実測 17580 は `intI1|dfrA17` が **6,350 bp 間隔で
+  3 コピー**、各コピーが自分の intI1・attI1・dfrA17 を持つ。`signature_counts` で
+  可視化する。ただし**アセンブリの反復崩壊でコピー数はずれる** — BSI ペア 13 組の
+  うち 2 組は「同一シグネチャのコピー数だけ 2 vs 3」で食い違った (#20)。
+- **`contig_edge_truncation` を持つこと。** 実測 TAS055_Illumina は 3,920 bp /
+  被覆 3.4× の contig に intI1 が乗り、contig の残りが 286 bp しかないため
+  3'-CS が sul1 に届かず `partial` になっていた。
+  **「構造が不完全」と「アセンブリが切れている」を区別できないと誤読される。**
+- **AMRFinder が使えないときに `In0` と断定しないこと。** カセットが見えないだけの
+  状態を「カセットを持たないインテグロン」と報告すると #28 の偽陰性に戻る。
+  `completeness="unknown"` + 警告にする。
+- **`tni_elements` に座標も返すこと。** locus の範囲 (= 図の描画幅) を決めるのは
+  tni なので、名前だけ返すと**図の右側が広く空いて「何も無い領域」に見える**。
+
+#### 妥当性の検証 (2026-09-02)
+- **kaoki_stec の ONT/Illumina ペア 259 組で 257 組 (99.2%) が完全一致。**
+  不一致 2 組はどちらも ONT 側のアセンブリ欠損 (TAS159 は intI1 が被覆 0.67 で
+  切れている / TAS055 は被覆 3.4× の contig ごと欠落) で、**手法ではなく入力の差**。
+- BSI ペア 13 組は 11 組一致、残り 2 組はタンデムコピー数だけの差。
+- **yamaguchi 8 検体は 0 件** (陰性対照として素通り)。
+- 独立指標 (AMRFinder の qacEΔ1+sul1) との突き合わせで、検出 207 検体 vs
+  マーカー 174 検体。差は 3'-CS を持たない型 (`intI1|dfrA17` 等 77 locus) と
+  sul3 型 (26 locus)。**43 種のシグネチャはすべて文献既知の In 型として読める**
+  (`intI1|blaIMP-1|aac(6')-IIc|3'-CS` 63 件 = 本邦の IMP-1 型が最多、
+  `intI1|aac(6')-Ib-cr5|arr-3|dfrA27|aadA16|3'-CS` 等)。
+- **カセットにカルバペネマーゼを載せた検体が 131 件** (toho_micro_id は 76/76)。
+
+#### 描画
+- カード `IntegronCard.tsx`: `intI1 ◄ | attI1 ▼ | カセット ► | 3'-CS ▬ | tni ▬` の
+  線形地図 + カセット表。**配列方向を右向きに揃えるため必要なら左右反転する**
+  (文献の図は必ず intI1 が左。座標順に描くと半数が鏡像になり見比べられない)。
+  反転したことは図の下に必ず書く。**座標そのものは書き換えない** (#21/#22)。
+- Genome Map に**3 本目のレーン**を足した (円形 = 最外周 r=91–98 / 線形 = 最下段)。
+  いちばん読ませたいのは「**この AMR 遺伝子はインテグロン内にある**」なので、
+  区間を全トラックにまたぐ半透明の帯 (opacity 0.13, `pointer-events: none`) で示す。
+  実測スクリーンショットで `blaNDM-5` が帯の**外**にあることが一目で読めた。
+- **色と幾何は `lib/integronColors.ts` に集約**。カード / Genome Map / htmlExport の
+  3 か所が使うので複製すると「同じカセットが図によって違う色」になる (#42 / #45.4)。
+  **カセットの色は `classColor` を再利用**して Genome Map の AMR トラックと揃える。
+- attI1 は 91 bp = 数 kb の図で 1px 未満なので**ロリポップ (▼) で描き、
+  透明な当たり判定層を最前面に重ねて最小 10px を確保**する (#45.2)。
+  ツールチップの位置は `lib/tooltipPosition.ts` (#45.1)。
+- **In0 の contig がレーンごと消える罠**: `buildContigOrder` は
+  `numAmr > 0 || numMge > 0` で染色体 contig を絞るので、**カセットを持たない
+  インテグロンだけを載せた contig は落ちる**。`numIntegron` を足して判定に含めた。
+
+#### 同席で直した既存の不具合
+1. **`canonicalMgeType` が `Tn` / `cn` を一度も返していなかった。** MEFinder の
+   type は `composite transposon` / `unit transposon` / `mite` という**語句**で、
+   先頭 2 文字判定では `insertion sequence` だけが偶然 `IS` に当たっていた。
+   実測 **composite transposon 4,412 件 / mite 4,204 件 / unit transposon 190 件が
+   全部 `other` (灰色)**。`mgeTypeLabel()` も追加。
+2. **`canonicalContigName` が SPAdes ヘッダを落としていなかった。**
+   `_length:` (コロン = Flye/dnaapler 形式) しか見ておらず、
+   `NODE_103_length_3920_cov_3.422768` (アンダースコア) が素通り。
+   実測 TAS055_Illumina では molecule_classification が `NODE_103` を持つのに
+   AMRFinder/MOB-suite/blast は完全な SPAdes ヘッダを返すため突合が全滅し、
+   **Genome Map のレーンが 1 本も出ていなかった** (修正後 29 レーン)。
+3. `blastn` は **`-subject` 指定時に `-num_threads` を無視する**
+   (`'num_threads' is currently ignored when 'subject' is specified`)。
+   ルールの threads を 1 に落とした (2 以上は Snakemake のコア予算の無駄)。
+
+#### 未実装 / 次にやること
+- **層 B (IntegronFinder 2.0.6) は 2026-09-02 に実装済み → #46.1 を参照。**
+  ワーカーに `integronfinder_env` を作るまで `not_configured` (= 未設定) で、
+  層 A の結果だけが出る。`--topology-file` は実測でも必須だったが、
+  **contig 名のサニタイズは不要だった** (`:` 入りの名前がそのまま通る)。
+- **backfill は `workflow/scripts/backfill_integron.py` で実施 → #46.2 を参照。**
+  3'-CS フィルタは**本物を 33 検体取り落とす** (sul3 型は定義上 qacEΔ1/sul1 を
+  持たないため。感度 84%) ので**全 823 検体**を対象にした。
+  **NAS の `input/contigs.fasta` は dangling symlink** (#17) なので候補順解決が必要。
+  加えて **assembly_complete モードは `input_class.json` の `contig_path` が
+  `/mnt/nas/...` を指す**ので、Mac から回すならマウント読み替えが要る
+  (実測: harada_ndm 28 検体がこれで「contig 無し」になった — #35 と同型。
+  ワーカー上なら NAS が同じパスで見えるので不要)。
+- `mobileelement` / `plasmidfinder` も status=FAIL がタイムラインで緑チェックに
+  見える構造を抱えている (実測 MEFinder は 825 検体中 133 検体が FAIL)。
+  今回は `_MODULE_FAIL_VISIBLE` を integron だけに絞った (既存ジョブの表示が
+  一斉に赤くなるのを避けるため)。
+- Results 一覧への列追加は**していない** (`summary_row.py` のキャッシュを触ると
+  800+ 検体の backfill が必要になる)。
+- カセットシグネチャ (`intI1|blaIMP-1|aac(6')-IIc|3'-CS`) は **In 番号の代わりに
+  使える検体間比較キー**。距離マップ (#41/#44) の色分け軸に足すのが自然な次段。
+**該当ファイル**: `workflow/resources/integron/` (build_markers.py + 凍結した
+FASTA/TSV), `workflow/scripts/classify_integron.py` (新規・単一の真実源),
+`workflow/rules/stage1_integron.smk` (新規), `workflow/tests/test_integron.py` (新規),
+`workflow/scripts/per_sample_report.py` (`_build_integron_section`),
+`workflow/rules/stage4_aggregate.smk`, `workflow/Snakefile`,
+`config/config.yaml` の `integron` セクション,
+`api/services/result_parser.py`, `api/services/snakemake_runner.py`
+(`_MODULE_FAIL_VISIBLE`), `frontend/src/lib/integronColors.ts` (新規),
+`frontend/src/components/IntegronCard.tsx` (新規),
+`frontend/src/lib/genomeMapUtils.ts` (`normalizeIntegrons` / `canonicalMgeType` /
+`canonicalContigName` / `numIntegron`), `frontend/src/components/GenomeMap.tsx`,
+`frontend/src/components/GenomeMapSection.tsx`, `frontend/src/lib/htmlExport.ts`
+(`renderIntegrons`), `frontend/src/pages/SampleDetail.tsx`,
+`frontend/src/components/PipelineTimeline.tsx`
+
 ### 47. 参照ゲノムを補充した検体の cgSNP 再実行が再アセンブリを引き起こしていた
 **背景**: 参照が無くて skip された検体 (`mapping.done` に
 `SKIPPED: no reference genome for {species} ST{st}`) は、参照を補充した後に
@@ -1949,3 +2119,357 @@ species_dir / ST の解決を複製することになるので採らない。
 (`_CORE_SNP_MAP_INPUTS`, `_core_snp_map_input_paths`, `_core_snp_stage_plan`,
 `_run_core_snp_batch` の段階実行, `_await_core_snp_completion(result_rel=, newer_than=)`),
 `api/tests/test_core_snp_stage_plan.py` (新規)
+
+### 46.1 層 B = IntegronFinder (attC / In0 / CALIN) — 役割分担は実測で決まった
+2026-09-02 に層 B を実装。**ローカル (Mac) に IntegronFinder 2.0.6 を隔離環境で
+入れて実データで通してから**パーサを確定した (#42 の方針)。
+hmmer/infernal/prodigal はスクラッチでソースビルド。**hmmer 3.3.2 と
+infernal 1.1.4 は Apple Silicon で configure が通らない**
+(`No supported vectorization found`) ので hmmer 3.4 / infernal 1.1.5 を使った
+(本番は bioconda のピン留め版。`.integrons` の書式は版に依存しない)。
+
+#### 実物で確認した `.integrons` の中身
+列は `ID_integron / ID_replicon / element / pos_beg / pos_end / strand / evalue /
+type_elt / annotation / model / type / default / distance_2attC /
+considered_topology`。`type_elt` ∈ `protein` / `Promoter` / `attI` / `attC`、
+`type` ∈ `complete` / `CALIN` / `In0`。
+- **`ID_replicon` は元の FASTA ヘッダの先頭トークンそのまま。**
+  `contig_2_length:87295_cov:103_circular` のような `:` 入りの名前も**そのまま通る**
+  ので、**サニタイズは不要**だった (予測していた #22 型の罠は空振り。
+  名前を差し替える方が突合を自作することになり有害)。`canonical_contig` で畳めば済む。
+- **`element` はタンパクの prodigal 連番で、遺伝子名は `annotation` 列に
+  NCBIFAM の HMM 名**で入る (`blaIMP-NCBIFAM` / `AAC_6p_IIc-NCBIFAM` /
+  `ANT_3pp_AadA1-NCBIFAM`)。**アレル名ではない** → カセット名は AMRFinderPlus の
+  ままにする判断が実物で裏づけられた。層 B の `annotation` は
+  「AMRFinder が名前を付けていないカセット」を拾うためだけに使う。
+
+#### `--topology-file` は必須 (ドキュメントどおり)
+実測: 名前に `_circular` と書いてある環状プラスミドでも `.summary` の topology 列が
+`lin` になり、`--topology-file` を渡すと `circ` に変わった。
+- 形式は `<seq_id> <circ|lin>` を `entry.split()` するだけなので **id に空白は不可**
+  (先頭トークンだけ書く)。
+- **載っていない replicon があってもエラーにならず既定に落ちる。** FASTA に無い id を
+  書いても無視される。→ `molecule_classification.json` が知っている分だけ書けばよい。
+- 環状性の真実源は `molecule_classification.json`、無ければ contig ヘッダの
+  `_circular`、それも無ければ**書かない** (推測で circ と書かない)。
+**該当**: `workflow/scripts/prepare_integron_finder.py`
+
+#### インテグラーゼは層 A、attC は層 B — 実測で分かれた
+実測 harada_ndm 03_GD33: blastn が **100% 同一性・全長 (1,014 bp) の intI1 を
+6 か所**で見つけるのに、**IF はそのうち 3 か所を CALIN (インテグラーゼ無し)**
+と呼んだ。原因は prodigal がその ORF を呼んでいないこと (IF の intI 判定は
+prodigal → HMM (Phage_int ∩ intI の**共通部分**) の順なので、ORF が無ければ
+到達しない)。
+- **`--union-integrases` は使わないこと。** 緩めても CALIN のままで、代わりに
+  **染色体 1 本に In0 が 11 個**湧いた (XerC/XerD やプロファージのインテグラーゼ)。
+- したがって **`completeness` と `class` は層 A の blastn を採用し、IF の `type` は
+  `integron_finder.type` として併記**する。食い違いは `note` で明文化して UI に出す。
+- 逆に **attC は層 A では原理的に取れない** (共分散モデルが必要)。実測で
+  カセット数と attC 数がよく対応し、**AMRFinder が名前を付けていないカセット
+  (機能未知の orf) が 5 個**見つかった = 層 B の実質的な付加価値。
+
+#### IF は 1 replicon の失敗で全体が異常終了する — が残骸は使える
+実測 (251 contig の Illumina 検体): prodigal が 1,752 bp の contig で **SIGSEGV**
+(`returncode = -11`) し、統合 `.integrons` は作られなかった。
+**ただし処理済み replicon 別の `.integrons` は 129 本残り、インテグロンを載せた
+contig もその中にあった。** なので:
+- 統合ファイルがあれば `ok`、無くて replicon 別があれば **`partial`** として使い、
+  **`replicons_analyzed / replicons_total` を必ず記録**する。
+- **`attc_searched` は locus ごと (= その contig を IF が処理したか) で持つ。**
+  未解析 contig の locus を「attC 無し」と言ってはいけない。
+  `analysis_level` が `marker+attc` に上がるのは**全 locus で探索できたときだけ**。
+- **`attc_searched` を「IF locus が当たったか」で決めてはいけない** (実装中に踏んだ)。
+  IF が正常に走って attC を 1 個も見つけなかった locus (本物の In0) まで
+  「未探索」になり `analysis_level` が marker に落ちる。
+- なお prodigal の SIGSEGV は **Apple Silicon の自前ビルド固有かもしれない**
+  (bioconda の Linux ビルドでは未確認)。原因が何であれ「IF は途中で死ぬ」
+  という構造は同じなので、耐性側だけを実装した (#38: ローカル条件の観測を
+  本番の問題として報告しない)。
+
+#### 統合ファイルの見分け方を間違えると「クラッシュ = 正常終了 0 件」になる
+最初は「隣に `.summary` があるか」で統合ファイルを判定していたが、
+**IF は replicon ごとにも `{replicon}.summary` を書く** (実測 129 対)。
+その結果**落ちた実行が `status: ok` / 0 件**として報告された (#28.2 と同型)。
+正しい手掛かりは配置: `Results_Integron_Finder_<stem>/<stem>.integrons`。
+**親ディレクトリ名から stem を復元して突き合わせる** (入力ファイル名を知らなくても
+判定できる)。正常終了時は replicon 別ファイルは統合後に削除される。
+
+#### `# No Integron found` は「解析済み・0 件」
+インテグロン 0 件の replicon には `# No Integron found` だけの 20 バイトの
+ファイルが書かれる。これを「読み取り失敗」に分類すると**解析済み replicon 数を
+数え損ね**、attC を探した contig まで「未探索」になる (実装中に踏んだ:
+`replicons_analyzed` が 146 → 1 に見えていた)。
+
+#### 実測した所要時間 (Apple M4 / 8 CPU)
+| 検体 | 構成 | `--local-max` あり | なし |
+|---|---|---|---|
+| toho_micro_id 19403 | 5.2 Mb / 3 replicon | **9.2 秒** | — |
+| harada 03_GD33 | 5.2 Mb / 5 replicon | **41.5 秒** (attC 20) | 8.5 秒 (attC 19) |
+| TAS055_Illumina | 5.3 Mb / 251 replicon | 50 秒 (途中で SIGSEGV) | — |
+
+`--local-max` は **1 件多い attC のために 5 倍**。locus 判定 (complete/CALIN) は
+同じだった。ツールの推奨に従い既定 true にしてあるが、
+`integron.integron_finder.local_max: false` で落とせる。
+cgSNP が 25 分級 (#23) なのでクリティカルパスへの影響は無い。
+
+#### 実機検証 (2026-09-02, ワーカー 3 台に env 作成後)
+`integronfinder_env` を 3 台に作成後、**本番と同じ経路** (Linux + 実 env +
+実 Snakemake 7.32.4) で NAS の実検体を通した。スクラッチ (`/tmp`) に出力し
+NAS の results は書き換えていない。
+
+| 検体 | 構成 | 所要 (blastn+IF+parse) | 結果 |
+|---|---|---|---|
+| 19403 | Flye 3 replicon / 5.2 Mb | **16 秒** | `marker+attc` / IF ok merged 3/3 / attC 2 / IF=complete |
+| TAS055_Illumina | SPAdes **251 replicon** / 5.3 Mb | **79 秒** | `marker+attc` / IF ok merged **251/251** / attC 2 / IF=complete |
+
+- **ローカル (Apple Silicon) で出た prodigal の SIGSEGV は Linux では再現しない。**
+  251 replicon を全部通して統合ファイルが出た → 自前 ARM ビルド固有だった
+  (耐性コード自体は残す。IF が 1 replicon で全体を落とす構造は変わらない)。
+- 3 台の env は完全に同一: IF 2.0.6 / prodigal 2.6.3 / **INFERNAL 1.1.4 /
+  HMMER 3.3.2** (= IF がピン留めしている範囲内。ローカル検証で使った
+  1.1.5 / 3.4 より本番の方が正しい)。`cmsearch` / `hmmsearch` / `prodigal` は
+  いずれも env 内の実体。層 A の `blastn` も 3 台とも py39 に存在 (2.17.0+)。
+- 出力量は 52 KB (long-read) 〜 380 KB (Illumina。大半は 251 contig 分の
+  `replicons.json`)。**成功時は IF が replicon 別ファイルと `tmp_*` を消す**ので
+  NAS を圧迫しない (#37 の `spades_output` 84 MB のような問題は無い)。
+
+#### 実機で踏んだ: パーサが層 A の outdir から層 B のパスを組み立てていた
+ルールは `Completed` (exit 0, `.integrons` 1 件) なのに `parse_integron` だけが
+`not_configured` ("IntegronFinder output directory not present") を返した。
+`_snakemake_main` が層 A の `snakemake.input.outdir` (= `integron/scan`) に
+`"integron_finder"` を継ぎ足していた (層 A 時代のスタブの残骸)。実際の出力は
+`integron/finder`。**ローカルのテストは `integron_finder_dir` を明示引数で
+渡していたので露出しなかった** — ルールとスクリプトの結線は
+実機で 1 回通さないと確認できない (#28.1 の「ルール単体を見て判断しない」の
+スクリプト側版)。パスの知識を 2 か所に置かず `snakemake.input.finder` を使う。
+
+#### env が無いのは「検査不能」ではなく「未設定」
+ルールは `conda activate` を先に試し、失敗したら **`IF_SKIPPED`** を書いて exit 0
+(パーサは `not_configured`)。実行して失敗したときだけ `INTEGRON_FINDER_ERROR`
+(= `unavailable` = 赤い「検査不能」)。**この区別が無いと、env を作るまで全検体が
+赤くなって本物の失敗が埋もれる。** 4 経路 (env 無し / 無効化 / 成功 / 実行失敗) は
+実データで通してある。
+**必要な env (未作成)**:
+```
+conda create -n integronfinder_env -c conda-forge -c bioconda integron_finder=2.0.6
+```
+
+#### 描画
+- attC は **attI1 と色を分ける** (`#0891b2` / `#0f766e`)。役割が違う —
+  attI1 は 1 個で配列の起点、attC はカセットごとに 1 個。どちらもロリポップ (▼) で、
+  40〜200 bp なので**透明な当たり判定層で最小 10px を確保**する (#45.2)。
+- 機能未知カセットは**破線の灰色矢印**。AMRFinder に名前が無いので薬剤クラス色を
+  当てられない = 「色が付いていないこと」自体が情報。
+- `attc_searched === false` のときは **`attC 未探索` バッジ**を出す (`attC 0` に
+  しない)。カード末尾の注記も、探索済みなら「IntegronFinder で検出」、
+  未探索なら「attC 陰性という意味ではありません」に**書き分ける**。
+- **PASS でも `warnings` を必ず描く。** 「IF が 129/251 replicon で止まった」は
+  読み方を変える情報で、ここにしか無い (#28 / #40)。
+- Pc / P_intI1 プロモータ (`--promoter-attI`) も出す。Pc の型はカセットの
+  発現量を左右する。
+
+#### 同席で直した既存の不具合
+**`canonical_contig` (Python) が SPAdes ヘッダを落としていなかった。**
+`_length:` (コロン = Flye) しか見ておらず `NODE_103_length_3920_cov_3.422768`
+(アンダースコア = SPAdes) が素通り。`molecule_classification.json` は
+短名 `NODE_103` を持つので**実測 TAS055_Illumina で 251/251 が不一致**になり、
+Illumina 検体では染色体/プラスミドの区別と topology が全部「不明」に落ちていた。
+frontend の `canonicalContigName` は #46 で直していたので**片側だけ直した状態**に
+なっていた — **両方を同じ規則に保つこと** (テストで両形式を固定した)。
+
+**該当ファイル**: `workflow/scripts/prepare_integron_finder.py` (新規),
+`workflow/rules/stage1_integron.smk` (`integron_finder` ルール),
+`workflow/scripts/classify_integron.py` (`read_integron_finder` / `parse_if_rows` /
+`attach_integron_finder` / `canonical_contig`), `workflow/tests/test_integron.py`
+(層 B は**実出力そのまま**を fixture にしてある),
+`config/config.yaml` の `integron.integron_finder`,
+`frontend/src/lib/api.ts`, `frontend/src/lib/integronColors.ts`,
+`frontend/src/components/IntegronCard.tsx`, `frontend/src/lib/genomeMapUtils.ts`,
+`frontend/src/components/GenomeMap.tsx`, `frontend/src/lib/htmlExport.ts`
+
+### 46.2 既存検体への backfill で踏んだもの (配列方向 / CIFS の rename)
+2026-09-02、`workflow/scripts/backfill_integron.py` で NAS 全 823 検体に
+層 A+B を後追い適用した。**実行を始めてから 2 件のバグが出て、途中で止めて
+直してから回し直した。**
+
+#### backfill の作り: **コマンドを写さず、本物のルールを回す**
+blastn と IntegronFinder の起動をスクリプトに書き写すと、ルールを直したときに
+backfill が置いていかれる (#19)。そこで**検体ごとにスクラッチの results ツリーを
+作って `--allowed-rules integron_scan integron_finder parse_integron` で
+本物のルールを回し**、出来た `integron/` を NAS へ書き戻す。出力は新規実行と
+同一になる。スクラッチを経由するのは **NAS の `input/contigs.fasta` が
+リンク切れ symlink** (#17) で Snakemake の input に使えないから。
+レポートは `per_sample_report._build_integron_section` を import して
+**`integrons` セクションだけ**差し替える (#28: `--force` で全体を作り直さない)。
+
+#### ① 配列方向を「intI1 と attI1 の隣接関係」で決めてはいけない (重大)
+実測 (toho_omori 26427 の In_2): contig_2 上に
+`intI1 (254,485-255,498) → sul1 (259,382) → qacEΔ1 (260,215) →
+attC×3 (260,665-261,775) → attI1 (262,258-262,335)` の順で並ぶモザイク領域が
+あった (intI1 と 3'-CS の間隔 3,884 bp で `distance_thresh` 4,000 にぎりぎり
+収まり、1 つの locus に連結される)。
+intI1 基準で方向を決めると **+1** になり、カセット窓が配列の反対側を向いて
+**「attC が 3 個あるのにカセット 0 個 = In0」**と報告していた。
+修正後は `intI1|aac(6')-Il|fosI|qacG2|3'-CS` (カセット 3 個・間隔 8/135/154 bp
+= attC 3 個と一致)。**`aac(6')-Il` / `fosI` (ホスホマイシン) / `qacG2` の
+3 遺伝子がインテグロンに帰属されていなかった。**
+- **判定は「attI1 と 3'-CS が配列を挟む」関係を最優先にする。** カセット配列は
+  この 2 つの間にあるので、両方あればこれが最も確実。
+- **3'-CS が複数コピーあるときは attI1 に最も近いコピーを使う。**
+  Tn21 系モザイクでは 3'-CS が 2〜3 組あるのが普通 (実測 19400) で、
+  遠いコピーを使うと方向が反転しうる。
+- intI1 の隣接関係は 2 番目、intI1 の strand は 3 番目のフォールバックに落とす。
+- **「attC はあるのにカセットが無い」は方向バグの合図。** attC はカセットが
+  あった痕跡なので、両者が食い違う locus は必ず疑うこと。
+
+#### ② NAS (CIFS) で**ディレクトリ**を `os.replace` してはいけない
+`integron.tmp<pid>` → `integron` の rename が **13 検体中 1 件で
+`PermissionError` (EACCES)**。3 台とも uid=1000 で NAS への書き込み自体は可能
+(実測: `touch` は通る) で、同じワーカーの他検体では成功しているので**恒久的な
+権限問題ではなく CIFS のディレクトリ rename が不安定**なだけ
+(`vers=3.1.1, nounix, soft, uid=1000, forceuid, dir_mode=0755`)。
+- **ファイルの rename は確実** (#25 で全 NAS 書き込みに導入済みの形)。
+  そこで「中身を直接コピー → **最後に `integron_result.json` だけを
+  一時ファイル + `os.replace`**」に変えた。読み手 (API / レポート) が見るのは
+  この JSON だけなので、「無い」か「完全」しか見えない。
+- 失敗すると `integron.tmp<pid>` が NAS に残る。**残骸を掃除すること。**
+
+#### ワーカー間の権限は同一だった (疑ったが違った)
+最初は「kibanb/tugrip が mbuser 所有のディレクトリに書けない」を疑ったが、
+CIFS マウントは `username=qnap_micro` の単一資格情報 + `uid=1000,forceuid` で、
+**3 台とも uid 1000 = NAS 上の全ファイルの所有者**として見えるため書き込める。
+`ls -l` に出る `mbuser:mbuser` はマウントの forceuid による表示で、
+書いたワーカーを表さない。
+
+#### 分割は**アカウント単位ではなく検体単位のコストで**
+kaoki_stec だけで全 contig の 8 割 (54,572 / 55,513) を占めるので、アカウントで
+割ると 1 台に 363 分が乗る。所要は `15.2 秒 + 0.254 秒/contig` (実機 2 点の
+線形近似) なので、**検体をコスト降順に最も軽いワーカーへ入れる (LPT)** と
+275/275/273 検体・各 148 分 → `--jobs 3` で約 49 分に揃う。
+
+#### 実施結果 (2026-09-02)
+全 823 検体・**失敗 0**。所要 52 分 (壁時計) / 延べ 360 分。
+中央 12〜17 秒 / 90%点 51〜70 秒 / 最大 110 秒 (見積り
+`15.2 秒 + 0.254 秒/contig` より速かった)。
+
+| | |
+|---|---|
+| status / analysis_level | **823/823 が PASS かつ `marker+attc`** (層 B が全検体で成功) |
+| integron_finder | 823/823 `ok` (**Linux では 1 件もクラッシュしなかった**) |
+| クラス 1 陽性 | **205 検体 / locus 306 / attC 761** |
+| カセットに carbapenemase | **132 検体** |
+| 機能未知カセット | 107 個 (層 A では原理的に見えないもの) |
+| attC のみの領域 | 20 件 |
+| シグネチャ | 43 種 (最多 `intI1\|blaIMP-1\|aac(6')-IIc\|3'-CS` 64 件) |
+| NAS 追加容量 | 86 MB (823 検体分) |
+
+**監査 (`audit_integron.py`) は全項目クリーン**: 「attC>0 なのにカセット 0 個」
+**0 件** (方向バグの再発なし) / レポートと JSON の食い違い **0 件** /
+読めない JSON 0 件。IF が CALIN と言うのに層 A が intI を見ている locus は
+20 件で、いずれも `note` 付きで併記されている (仕様どおり)。
+
+**独立検算**: 修正前にローカルで取った層 A サーベイと突き合わせ、
+**822 検体中 820 検体 (99.8%) でシグネチャが完全一致**。不一致 2 件は
+**どちらも方向バグの修正そのもの** (`intI1|3'-CS` → 
+`intI1|aac(6')-Il|fosI|qacG2|3'-CS`) で、差分は全て説明が付いた。
+
+#### 検体でないディレクトリを黙って除外しないこと
+`results/` 直下には検体でないディレクトリが居る (実測: `plasmid_clusters` が
+全 8 アカウントに 1 つ、`kaoki_stec` に `SYNCPROBE1-3` の計 11 件)。
+検体の判定は `input_class.json` の有無で行うしかないが、これは
+**「検体なのに input_class.json が無い」ケースと区別できない**ので、
+除外した件数と名前を必ず出す (最初の版は黙って落としていた)。
+最終状態は「ディレクトリ 835 / `input_class.json` あり 824 /
+`integron/` あり 823」で、差の 1 件は `toho_micro_id/25648`
+(`assembly/` と `core_snp/` しか無い未完了検体。dry-run で skip と報告済み)。
+
+**紛らわしかった点**: ローカルのサーベイに居た `toho_omori/25645` /
+`25647` / `25928` が NAS から消えていた。**これは検体が
+`harada_ndm` へ移動していたため** (サーベイ時は両アカウントに重複して存在)。
+harada_ndm 側は 3 件とも層 B まで入っている。**NAS の検体はアカウント間で
+移動しうるので、検体名だけで突合しないこと。**
+
+#### 監視は「失敗が増えたとき」と「完了」だけ鳴らす
+進捗カウントの変化で通知すると 1 分ごとに鳴って埋もれる。
+`失敗数 > 前回` / SSH 到達不能 / 全完了 / 10 分ごとの定期報告に絞る。
+**pkill のパターンは自分のコマンド行に一致させないこと** —
+`pkill -9 -f backfill_integron.py` は自分を起動した `bash -c` にも一致して
+ssh セッションごと落ち、出力が返らないまま子プロセスが生き残る。
+`backfill_integ[r]on.py` のように括弧を挟めば自己一致しない。
+**該当ファイル**: `workflow/scripts/backfill_integron.py` (新規),
+`workflow/scripts/classify_integron.py` (`_array_direction`),
+`workflow/tests/test_integron.py` (方向の実測ケース 3 件)
+
+### 46.3 インテグロンを Genome Map カードへ統合 (overview + detail)
+2026-09-02。独立カードだった「クラス 1 インテグロン」を Genome Map カードに
+畳んだ。**尺度が 10〜1000 倍違うのが本質**なので、素直に並べるのではなく
+overview + detail (ドリルダウン) にしてある。
+
+- 地図のインテグロン帯 (#46 の 3 本目のレーン) を**クリックで選択**でき、
+  カード下部に**その locus のカセット地図と表**が出る。locus が 2 件以上なら
+  チップ (`In_4 · blaIMP-1 +2`) でも切り替えられる。
+- **既定の選択は「カルバペネマーゼを載せた locus」** (無ければ先頭)。
+  実測 205 陽性検体中 132 件がこれに該当するので、開いた瞬間に一番読ませたい
+  ものが出る。
+- **「どこを何倍に拡大したものか」を必ず 1 行で出す**
+  (`↓ 上の地図の網掛け (contig_7 : 7,800–16,302 bp / contig 全長 76,661 bp) を
+  約 9.0 倍に拡大したもの`)。これが無いと 2 つの図の関係が読めない。
+  倍率が 1.5 未満のときは数値を出さない (「約 1.0 倍」は誤解を招く)。
+- 図と表の実装は `IntegronCard.tsx` の `IntegronPanel` **1 つだけ**。
+  地図側に写さない (#19 / #45.4)。カードの殻だけを GenomeMapSection が持つ。
+- 配置は **AMR Gene Profile の直前** (旧 IntegronCard の位置) に Genome Map
+  カードごと移した。「その AMR 遺伝子がどの分子に載っていて可動性カセットの
+  中か」は AMR の読み方を変えるので、遺伝子一覧より先に目に入る必要がある。
+  **カードは SampleDetail の 2 列グリッド内なので `gridColumn: '1 / -1'` が必要**
+  (旧配置はグリッド外だったため指定が無く、移動しただけでは半分の幅に潰れる)。
+
+#### 前提だった欠落: Genome Map が 35% の検体で描画されていなかった
+`get_assembly_info` が per-contig 情報を返すのは **long_read だけ**で、
+`short_read` は `overall_stats` のみ、`assembly_complete` は分岐すら無かった。
+frontend の `buildContigOrder` は空配列を受けて `[]` を返すので、
+**カードが丸ごと出ない**。実測 2026-09-02 (NAS 824 検体):
+
+| | 検体 |
+|---|---:|
+| 地図が出る (long_read + Flye assembly_info.txt) | 533 |
+| **出ない** (short_read 262 / assembly_complete 28 / long_read 1) | **291** |
+| うちインテグロン陽性 | **42** (harada_ndm はほぼ全滅) |
+
+必要な情報 (contig 名/長さ/被覆/環状性) は `molecule_classification.json` が
+持っているので、`contigs` が空のときだけそこから作るフォールバックを入れた
+(**Flye の値は上書きしない**。由来は `contigs_source` に残す)。
+`depth`/`circular` が不明なときは **0 / false に潰さず null** にする
+(「被覆 0x」「直線」と読めてしまう — #42.2)。
+
+**インテグロン欄を地図の可用性に人質に取らないこと。** 地図が描けなくても
+インテグロンの所見は独立に価値があるので、`canDrawMap` が偽でも
+「contig 地図は表示できません…**地図が無いことは所見の有無とは無関係です**」
+と出して詳細は描く (#28 の趣旨)。
+
+#### 同席で踏んだ 3 つ (どれも実機でしか出ない)
+1. **フックを早期 return の後に置いた。** `visibleGenes` の `useMemo` を
+   `if (isLoading) return null` より下に入れてしまい、実機で
+   `Rendered more hooks than during the previous render` で画面が落ちた。
+   **`tsc` は通る** (#44 の TDZ と同型)。Results 画面を落とした前例と同じ罠。
+   → 早期 return の直前に「フックはこの行より上」と明記した。
+2. **`genes.filter(...)` を JSX 内で呼んでいた** (既存の作り) ため毎レンダー
+   新しい配列になり、GenomeMap の描画 effect が再実行されて
+   **d3.zoom の transform が初期化**されていた。選択のたびに拡大位置が飛ぶ。
+   → `useMemo` で包み、実測で `translate(-120,0) scale(2)` が選択後も
+   保持されること・同一 DOM ノードであることを確認した。
+3. `useMemo` の依存を `report` オブジェクト全体にしていた。現在の
+   SampleDetail は `reportQ.data.report` を渡すので参照は安定しているが、
+   **親の実装に依存させない**ため読んでいるスライス
+   (`report?.amrfinder` / `?.amr_gene_placeholder` 等) に絞った。
+   ハイライトは描画 effect とは**別 effect**で属性だけ更新する。
+
+**検証**: `frontend/__harness.html` で実データ 4 検体
+(1 locus / タンデム 4 locus / 6 locus / SPAdes 251 contig) を props 直叩きし、
+チップ選択・地図クリック選択・尺度注記の追従・ズーム保持・
+`gridColumn` の幅 (1240px) を DOM 実測で確認した (#45.6)。
+**該当ファイル**: `api/services/result_parser.py` (`get_assembly_info` の
+フォールバック), `frontend/src/components/GenomeMapSection.tsx`,
+`frontend/src/components/GenomeMap.tsx` (`selectedIntegronId` /
+`onSelectIntegron` / `integron-mark` / `integron-hit` / ハイライト effect),
+`frontend/src/components/IntegronCard.tsx` (`IntegronPanel` /
+`IntegronChips` / `IntegronScaleNote`), `frontend/src/pages/SampleDetail.tsx`
