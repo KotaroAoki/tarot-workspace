@@ -2473,3 +2473,43 @@ frontend の `buildContigOrder` は空配列を受けて `[]` を返すので、
 `onSelectIntegron` / `integron-mark` / `integron-hit` / ハイライト effect),
 `frontend/src/components/IntegronCard.tsx` (`IntegronPanel` /
 `IntegronChips` / `IntegronScaleNote`), `frontend/src/pages/SampleDetail.tsx`
+
+### 48. 参照データは「ルールがどこから読むか」で追跡の可否が決まる
+**発端 (2026-09-02)**: #46 で追加した `workflow/resources/integron/integron_markers.fasta`
+が `.gitignore` の `*.fasta` に捕まって未追跡だった。ルールはこれを
+`{workflow.basedir}/resources/integron/` から読むので、**クローン直後は
+全検体で `INTEGRON_ERROR` になる**。`git add -f` で追加して塞いだ。
+そのとき「同じ構造が `workflow/resources/paidb/` にもある」と述べたが、
+**これは誤り** — 見た目は同じでも帰結が逆だった。
+
+**判定基準はひとつ: ルールがどこを読むか。**
+
+| 読み先 | 例 | 配布 | git |
+|---|---|---|---|
+| `{workflow.basedir}/resources/...` | **integron のマーカー配列だけ** | `_sync_pipeline_files` が `workflow/` を tar 同期 | **追跡必須** |
+| `config.*.db_path` (NAS / conda env) | paidb・kmerfinder・resfinder・plasmidfinder・bakta・known_vectors 等 | ワーカーに手動配置 (#12) | **追跡しない** |
+
+前者はリポジトリが配布経路そのものなので、無ければ動かない。後者はリポジトリに
+何が入っていても本番の挙動に影響せず、リポジトリ側のコピーは単なる生成物。
+**`grep -rn 'workflow.basedir.*resources' workflow/rules/` が前者の全数** (現状 1 件)。
+
+**paidb の実測 (2026-09-02)**: 本番が読むのは
+`/mnt/nas/tarot/program/paidb/blast_db/paidb` (config 195 行目・
+`stage1_paidb.smk` の既定値も同じ)。`resources/paidb` を読むコードは
+パイプラインに **1 行も無い**。NAS の DB は `52 sequences / 6,327,071 bases`
+(PAIDB_v2_curated, 2026-06-25) で、**追跡済みの `pai_reference.tsv` 52 行と
+一致** = 取り込み漏れなし。ローカルの `paidb.nsq` と NAS 側は **md5 一致**
+(`6d34b083…`) で、NAS には FASTA も揃っている。よって 7.6 MB を git に入れても
+再現性は 1 も増えない。**追跡しないのが正しい。**
+再構築が要るときは `build_paidb.py` (BioPython + BLAST+ が必要。
+`pai_reference.tsv` から Entrez で取得して `makeblastdb`)。
+
+**`.gitignore` に意図を書くこと。** 従来は BLAST DB バイナリにだけ
+「build_paidb.py で再構築可能」というコメントがあり、**FASTA は `*.fasta` に
+偶然引っかかっていただけ**だった (だから integron で同じ罠を踏んだ)。
+`!workflow/resources/**/*.fasta` で前者を規則として救い、paidb だけを
+後続行で再除外してある。**新しい参照配列を `workflow/resources/` に置くときは
+`git check-ignore -v` で確認すること** — 追跡漏れは
+「自分の環境では動くがクローンでは全検体 ERROR」という形で出る。
+**該当ファイル**: `.gitignore`, `workflow/rules/stage1_integron.smk`,
+`workflow/resources/paidb/build_paidb.py`, `config/config.yaml` の `paidb.db_path`
