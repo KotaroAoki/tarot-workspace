@@ -2400,6 +2400,152 @@ ssh セッションごと落ち、出力が返らないまま子プロセスが�
 `workflow/scripts/classify_integron.py` (`_array_direction`),
 `workflow/tests/test_integron.py` (方向の実測ケース 3 件)
 
+### 42.4 構造比較の原点合わせ — DB の回転前 FASTA と、錨で選ぶ枠の 2 段の取りこぼし
+**発端 (2026-09-03)**: 「プラスミド構造比較で開始点は揃っているか / dnaapler は
+効いているか」。**dnaapler 自体は正常**だった — 長鎖の環状 contig 1,124 本中
+**979 本 (87.1%) が `rotated=True`** (dnaA 335 / repA 638 / terL 6)、未回転 145 本は
+**128 本が 10 kb 未満・中央値 3,642 bp** で rep 遺伝子が引けない小型 Col 系。
+同一クラスタの回転済みプラスミドは**開始点が完全に一致する** (AA002 の 27 本すべて
+offset 0・同鎖)。**dnaapler は Flye ルールの中でしか走らない**ので、`short_read`
+(SPAdes 262 検体) と `assembly_complete` (28 検体) は原理的に未回転。
+
+#### ① DB の登録済み FASTA が回転前のまま残る (再解析しても直らない)
+`register_plasmids_to_db.py` は **同じ plasmid_uid が DB にあればスキップ**する
+(`already in DB — skipping`)。したがって dnaapler 常時実行より前に登録された
+プラスミドは**永久に回転前**。実測: DB 806 本中 175 本がヘッダ欠落 (`>contig_2`
+だけ) で、現 results と長さが一致する 65 本は**全件で回転がずれていた**
+(271 bp〜177 kb、約半数は鎖も反転)。
+**被害は見た目ではない。** `collect_features` は **results 側の AMRFinder 座標を
+DB FASTA の座標軸に載せる**ので、DB が回転前だと**耐性遺伝子が実在しない位置に
+描かれる**。実測 19403__AA002 で blaIMP-1 が 5,759 bp・blaTEM-1 が 16,679 bp ずれ、
+鎖も反転していた。
+**対応**: `workflow/scripts/backfill_plasmid_rotation.py` (dry-run 既定)。
+2026-09-03 に **67 本適用済** (toho_micro_id 20 / _bsi 34 / _temp 13)。
+- 差し替えるのは `by_cluster/{cid}/{uid}.fasta` **だけ**。`index.tsv` / `meta.json` /
+  `.msh` は触らない (回転で size_bp・GC は不変。mash は接合部の k-1 個しか変わらず
+  76 kb・k=21 で 0.026%。pling の DCJ は環状に対して回転不変)。
+- **条件は「長さが完全一致し、回転 (必要なら逆相補) で完全一致する」こと**。
+  1 塩基でも違えば別アセンブリなので触らない。多 contig は回転が定義できないので対象外。
+- `_structure_cache` は size+mtime 判定なので**自動失効する** (実測 55 件中、
+  差し替えた 7 件だけが無効化)。
+- **CIFS ではディレクトリの rename が不安定** (#42.2) なので、書き換えは
+  ファイル単位の 一時ファイル + `os.replace`。退避は `_backup/<ts>_rotation/` に
+  `CHANGED.tsv` 付きで残す。
+
+#### ② `estimate_frame` の「最長 HSP を錨にする」規則が、揃った原点を外す
+①を直したら、**枠推定の方が原点を壊していた**ことが見えた。最長ブロックは
+**挿入の下流**に来るので、錨がそこに付いて原点からずれる。実測 (AA002, ①適用後):
+
+| query | 最長錨での枠 | 共線性 | 原点そのまま |
+|---|---|---|---|
+| 19403__AA002 | offset 10,636 | 0.947 | **1.0000** |
+| 19419__AA002 | offset 45,025 | 0.675 | **1.0000** |
+| 17575__AA002 | offset 14,313 | 0.945 | **1.0000** |
+
+**解決**: 候補オフセットを**実際に当ててみて共線性が最大になるものを選ぶ**
+(`_best_offset` / `_score_offset`)。候補は各 backbone HSP の対角に
+**offset 0 を必ず加えたもの**。同点なら支持長が大きい方、それも同点なら offset 0。
+- **回転は原点をまたぐ HSP を割って順序を壊す**ので、揃っている相手では
+  offset 0 が自然に勝つ。逆に**本当に回転している相手**では従来どおり回る
+  (実測: 退避した回転前の 19403 では offset 52,094+反転 で共線性 1.0。
+  旧規則の offset 62,729 = 0.947 より良い枠を選んだ)。
+- 評価は**描画と同じ `apply_frame_to_hsp` を通す**こと。原点またぎの分割まで
+  含めないと、選んだ枠と描かれる図がずれる。
+- **`anchor_length_bp` の意味を変えた** = 「その枠で向きが揃う最長ブロック」。
+  対角一致で数えると、揃っているペアほど錨が小さく出る (実測 65,599 bp が
+  3,853 bp に化ける)。UI 文言も「向きが揃う最長ブロック」に直した。
+- 候補は支持長の大きい順に **32 本まで** (断片化した相手で候補が爆発しても
+  応答時間が読めるように)。
+- **`LOGIC_VERSION` を 3 → 4 に上げること** (#42.2)。上げないと
+  `_structure_cache` が古い枠を返し続ける。判定を変えたら必ず上げる。
+**実データ回帰 (無作為 158 ペア、旧規則と新規則を同じ blastn 結果で比較)**:
+改善 49 / 同じ 109 / **悪化 0**。最大 +0.288 (TAS006_ONT__AA667 vs TAS007_ONT__AA667:
+offset 363 → 0 で 0.712 → 1.000)。**常に 0 を選ぶわけではない** — 実測
+TAS006_ONT__AB745 は offset 33 を選んで 0.858 → 1.000。
+
+#### 残っていた別問題 → #42.5 で解決
+**DB の FASTA は登録時点で凍結される**ので、検体を再解析すると DB と results の
+配列が食い違っていた (実測 95 本)。回転では説明できないので上の backfill の
+対象外だったが、2026-09-03 に #42.5 で解消済み。
+**該当ファイル**: `workflow/scripts/backfill_plasmid_rotation.py` (新規),
+`workflow/scripts/compare_plasmid_structure.py` (`MAX_FRAME_CANDIDATES`,
+`_score_offset`, `_best_offset`, `estimate_frame`, `LOGIC_VERSION`),
+`workflow/tests/test_compare_plasmid_structure.py`,
+`frontend/src/lib/api.ts` (`offset_rule`),
+`frontend/src/components/PlasmidStructureCompare.tsx` (錨の文言)
+
+### 42.5 plasmid DB は uid 単位の追記専用だった — 更新も撤回もされない
+**発端 (2026-09-03)**: #42.4 で「DB の FASTA は登録時点で凍結される」と書いた 95 本の
+正体を追ったところ、凍結ではなく**登録側の 2 つの穴**だった。
+
+#### ① 既登録なら中身を見ずにスキップする
+`register_plasmids_to_db.py` は `plasmid_uid` が既登録なら skip する。uid は
+`{sample}__{primary_cluster_id}` で**アセンブリが変わっても同じ**なので、
+再解析しても DB のコピーは永久に更新されない。**登録自体は毎回走っている**
+(DB 登録のある 439 検体すべてで `registration.json` がアセンブリ以降) — 走った上で
+毎回スキップしていた。実測 806 本中 95 本が現ソースと不一致で、多くは
+**medaka 研磨前の配列** (同一性 95〜99%)。
+**見た目だけの問題ではない。** `collect_features` は **results 側の AMRFinder 座標を
+DB FASTA の座標軸に載せる**ので、DB が古いと遺伝子が実在しない位置に描かれる。
+**DB に旧配列を残す構成は原理的に不整合**で、現ソースへ揃えるのが唯一整合する状態。
+
+#### ② プラスミドが 0 件になった検体は撤回されない
+`if not cluster_to_contigs: return` が `_prune_stale_entries` より**前**にあった。
+実測 toho_omori 26410 は molecule 判定の修正 (#19) で全 12 contig が染色体になったが、
+早期 return のせいで**染色体断片 2 本 (166 kb / 51 kb) が「プラスミド」として DB に
+残っていた**。撤回機能自体は 2026-07-29 に入っており、それ以前の登録
+(19402 の 2 件) も同じく残っていた。
+
+#### ③ 更新元 (`mob_recon_output/`) 自体が汚れている
+ルールは実行前に `rm -rf` するが、**ワーカーの結果を `cp -a` で NAS へアーカイブ
+するとマージされる**ので旧実行のファイルが残る。実測 19402 では 6/23 の
+`plasmid_AA002.fasta` が 7/13 のファイルと同居していた。更新機能を入れる以上、
+**残骸で上書きしないガードが必須**。
+
+**解決**:
+- 登録側: skip 条件を「uid 既登録 **かつ DB のコピーが現ソースと同一**」に変更し、
+  違えば FASTA/meta/index 行を差し替える (`num_refreshed`)。index は追記専用設計
+  なので `replace_index_row` で**行を書き換える** (追記すると同じ uid が 2 行になる)。
+  早期 return は prune の**後ろ**へ移した。更新経路では `_find_plasmid_fasta` の
+  曖昧一致を使わず `plasmid_{cid}.fasta` 直接一致のみ + `source_is_current` で
+  現アセンブリ由来を確認する。
+- 既存分: `workflow/scripts/backfill_plasmid_db_refresh.py` (dry-run 既定)。
+  **判定関数は登録側から import する** (写すと必ず食い違う — #19)。
+  2026-09-03 に **95 本適用済** (toho_micro_id 25 / _bsi 67 / _temp 3)。
+- 撤回 5 本は**既存の `prune_plasmid_db.py --uid … --apply`** で実施
+  (`_pruned/` 退避と index lock を持っている。新規ツールは書かない)。
+- **`.msh` は再生成しなくてよい** — 保存済みスケッチを読むコードが 1 か所も無い
+  (Layer B.1 は `all_plasmids/` の FASTA から mash を計算し直す)。`--mash-bin` を
+  渡したときだけ作り直す。
+
+**tier で刻むこと**: `safe` (単一 contig・相互被覆 ≥99%・同一性 ≥95%・**長さ比 ≥0.95**)
+/ `multi` (contig 構成が変わった) / `changed` (それ以外)。
+**長さ比を見ないと多量体を見逃す** — 単量体が 2 コピー並んだ contig は、単量体から
+見ても多量体から見ても**被覆 1.0**になる (実測 19403__AB228: 38,140 → 76,281 bp で
+被覆 1.0/1.0・同一性 99.73)。被覆と同一性だけでは「同じ分子」と誤判定する。
+
+**副産物: 多量体の取りこぼしが見えた。** `changed` 16 本のうち **11 本が
+単量体/多量体の食い違い**で、8 本は**現 results の方が多量体**
+(`20914__AA013` 4,502 → 22,116 = 4.9 倍、`16656__AD996` 3,861 → 18,728 = 4.9 倍、
+`22188__AA411` / `20926__AA411` が 2 倍)。`collapse_concatemers` は動いてはいる
+(同じ検体で別 contig は縮約されている) が、`repeat_fraction 0.95` を満たさない
+多量体を取り逃がしている。**同じプラスミドが検体によって 1× と 2× で DB に入る**と
+クラスタが割れるので、#30 の閾値は別途見直しが要る。
+
+**撤回した 5 本の素性 (「消えた」ではない)**: 19402 の AA002 (87 kb) と AA445 (121 kb) は
+MOB-suite の再クラスタリングで**両方まとめて AA451 になった** (121,738 + 87,295 =
+209,033 = 現 AA451)。kojima 18999-5__AA664 は現解析では chromosome 判定。
+toho_omori 26410 の 2 本は #19 で染色体と確定したもの。**いずれも同じ DNA が
+別の形で残っているか、そもそもプラスミドではない。**
+
+**残った 12 本 (`results_gone`)**: results ごと消えた検体 (`*_bsi_TestDordo` の
+テスト検体 5 件を含む)。現物と照合できないので触っていない。
+**該当ファイル**: `workflow/scripts/register_plasmids_to_db.py`
+(`fasta_fingerprint` / `assembly_sequences` / `find_plasmid_fasta_strict` /
+`source_is_current` / `replace_index_row`, refresh 分岐, prune 順序),
+`workflow/scripts/backfill_plasmid_db_refresh.py` (新規),
+`workflow/tests/test_plasmid_db_refresh.py` (新規)
+
 ### 46.3 インテグロンを Genome Map カードへ統合 (overview + detail)
 2026-09-02。独立カードだった「クラス 1 インテグロン」を Genome Map カードに
 畳んだ。**尺度が 10〜1000 倍違うのが本質**なので、素直に並べるのではなく
