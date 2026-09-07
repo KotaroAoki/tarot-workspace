@@ -2808,6 +2808,20 @@ FastANI 側も `species_threshold` 未満では `species_assignment` を付け�
 `below_threshold` に落とす。**「該当なし」で終わらせない** — 実測 17576 は
 新種を示唆する所見であり、そこに情報がある。
 
+**`no_reference` の内訳を固定文で説明しないこと (2026-09-07 に踏んだ)。**
+DB を更新すると同じ status のまま原因が変わる。実測 17576 は
+12,751 → 20,704 株への更新で
+「同一性の下限を超える参照が 0 件」→「近縁株は在るが菌種境界 0.95 未満」に移った
+のに、画面と HTML が**「タイプ株が 1 件もありませんでした」を固定文で出していた**
+ため、**同じ画面の Mash Top Hits 1 件・ANI Top Hits 1 件と矛盾**した
+(#28.2 の `failed (exit=0)` と同型 — 自己矛盾した文言は判定側が壊れている合図)。
+`status_detail` (`no_hits` / `below_threshold`) を workflow 側で決めて描画側は
+選ぶだけにする (#19)。内訳は **mash の `top_hits` 件数**で決めること —
+relaxed 経路は `top_hits` を空に保つので「下限超えが無かった」と一致する。
+判定は `resolve_species_status()` に切り出してある (`main()` にインラインだと
+本番コードでテストできない)。**旧レポートは `status_detail` を持たない**ので
+描画側は `no_hits` 相当に倒す (導入前はそれしか起こり得なかった)。
+
 **該当ファイル**: `workflow/scripts/run_mash_screen.py` (`_write_result`,
 `MASH_MIN_IDENTITY` / `MASH_RELAXED_IDENTITY`),
 `workflow/scripts/merge_species_id.py` (`MASH_SPECIES_IDENTITY`,
