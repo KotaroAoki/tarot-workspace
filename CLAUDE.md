@@ -2983,3 +2983,139 @@ CSV 行数とスケッチ件数がずれる (実測 37 件。preflight が捕ま
 `VERIFY_GZIP_UPLOAD`, ステージングループ),
 `api/tests/test_upload_gzip_check.py` (新規),
 `workflow/rules/stage1_flye_assembly.smk` (リード結合ループ)
+
+### 51. pMLST (plasmid MLST) — 検体単位で走らせると複数プラスミドが 1 型に潰れる
+**動機**: プラスミドの「型」として持っていたのは PlasmidFinder のレプリコン名
+(`IncFIB(K)` 等)・MOB クラスタ ID・pling の DCJ 距離だけで、**文献や他施設の
+報告と突き合わせられる標準的な型が無かった**。pMLST は IncF の RST formula や
+IncHI2 の ST を与える。
+
+**実行は `pmlst.py` (CGE) + `pmlst_db` を NAS 共有に置き、py39 の blastn で回す。
+Docker は使わない** — PlasmidFinder のイメージが honban にだけ無く 26/90 検体が
+無言の偽陰性になった件 (#28) の再現になる。導入は
+`git clone https://bitbucket.org/genomicepidemiology/pmlst{,_db}.git` +
+`INSTALL.py`。`cgecore` / `tabulate` は VirulenceFinder と共用で py39 に既存。
+
+#### 実行は **contig 単位**。これは最適化ではなく正しさの要件
+`pmlst.py` はアセンブリ全体を 1 単位として扱い **locus あたり best hit を 1 件
+しか返さない**うえ、出力 (`results_tab.tsv` / `data.json` /
+`Hit_in_genome_seq.fsa` のヘッダ) に **contig 名がどこにも無い**ので後から
+属性付けもできない。実測 (2026-09-07):
+- 22439 は IncF レプリコンを **5 本の contig** (別々の MOB クラスタ AA035 /
+  AA439 / AA450 / AC125 / AA405) に持つが、全体を入力した答え `[K9:A-:B-]` は
+  **contig_6 だけの型**で、残り 4 本は消えていた。
+- 17569 は IncF が 5 contig にあり、contig 単位だと **3 つの型**
+  (`[K5:A-:B-]` / `[Y6:A-:B-]` × 2) が出るが、全体では `[K5:A-:B-]` の 1 つだけ。
+- NAS 全体で **310/1111 検体 (28%)** が同一レプリコンファミリーを 2 contig 以上に
+  持つ (複数スキーム同居も 114 検体)。
+
+**3 パス構成** (`run_pmlst.py`): ① `blastn -query {scheme}.fsa -subject contigs`
+で位置特定 → ② 当たった contig を 1 本ずつ切り出して当たったスキームだけ
+`pmlst.py` → ③ アセンブリ全体を 1 回だけ回して「CGE 標準の検体レベルの答え」を
+参考値として残す (文献比較用。**per-plasmid の代わりにはしない**)。
+①を自前でやるのは「位置」だけで、アリルコールと ST 決定の権威は CGE に残す
+(#42 の構造比較と同じ役割分担)。実測 0.26〜0.36 秒/contig・13 contig の検体で
+約 2.3 秒。
+
+**スキーム選択に PlasmidFinder を使わないこと。** レプリコン駆動にすると
+PlasmidFinder の失敗が pMLST の偽陰性に伝播する (#28)。8 スキームしかなく
+1 スキーム 1 秒なので全部当てて、レプリコンは**クロスチェック表示専用**にする。
+
+#### 出力の読み違え — 実測で 3 つある
+1. **`[F-:A-:B-]` は「型」ではなく「型なし」**。IncF だけは formula 形式なので
+   アリルが 1 つも当たらなくても `ST=Unknown` ではなくこの文字列を返し、
+   **染色体 contig でも返る**。判定は 2 段階で、**どちらも要る**:
+   - アリルヒット 0 件 → `no_call`。
+   - **ヒットはあるが完全一致が 1 つも無い → 型は `None` (`call=partial`)。**
+     formula は完全一致のアリルしか採らないので全ダッシュになる。実測 22439 の
+     contig_5 (FIIY_7 が 97.09%) が該当し、**最初の実装は前者しか見ていなかった
+     ため backfill の dry-run で `型=2 [IncF RST [F-:A-:B-], ...]` と出て発覚した**。
+     判定は文字列に数字が含まれるかで行う (`formula_has_call`)。
+2. **IncF の formula は `identity == 100.0` のアリルしか採らない**
+   (`pmlst.py` L504-529 を実読)。したがって **`A-` は「FIA が無い」とは限らず、
+   「FIA はあるが完全一致ではない」ことがある**。実測 22439 contig_6 は
+   FIA_26 を 98.17% で検出しながら `A-`。`formula_understates` に残して UI と
+   HTML 両方に必ず書く。
+3. **部分プロファイルは ST に解決されないが近縁 ST は出る**。実測 19400 の
+   inchi1 は 6 座位中 5 座位ヒットで `ST=Unknown` / `nearest_sts='13'`。
+   陰性ではなく `partial`。
+
+**PlasmidFinder が IncFIB を検出しても pMLST が `B-` を返すのは正常**
+(対象領域も閾値も別物)。実測 22439 の contig_3/7/8、17569 の contig_11/4 が該当。
+`replicons_without_type` に情報として残すが**警告にはしない**。
+
+**分子の判定は `molecule_classification.json` を見ること。** MOB-suite の
+`molecule_type` はクラスタ不能なプラスミドを chromosome に落とす (既知)。実測
+17569 の contig_11 / 12 / 6 は MOB が chromosome・cluster `-` だが、権威では
+いずれも plasmid (high/medium)。**MOB クラスタが無いプラスミドは plasmid DB にも
+載らないので `plasmid_uid` は None になる** — これは整合しており異常ではない。
+
+#### `INDEX_FIELDS` に列を足すと既存 DB が壊れる (同席で発見・修正)
+plasmid DB の index.tsv 追記は `INDEX_FIELDS` を**無条件に**使っていた。列を
+2 つ足した瞬間から既存 DB のヘッダと食い違い、`carbapenemase_genes` より後ろの
+列 (`registered_at` / `fasta_path` / `meta_path` / `msh_path` …) が**丸ごとずれて
+壊れる。しかもエラーにならない**。対策は 2 つ:
+- `_ensure_index_header()` が不足列を検出したら **一時ファイル + `os.replace`**
+  で移行する (既存列の順序は保ち、新列を末尾に足す)。実 DB 8 件 808 行のコピーで
+  既存値の完全保全と冪等性を確認済み。
+- 追記は `index_fieldnames()` で**実ヘッダを読んでから**書く。
+**NAS 上の共有 TSV に列を足すときは必ずこの形にすること。**
+
+#### backfill で踏んだ運用上の罠 (実測 2026-09-07)
+- **`index.tsv` の `source_results_dir` は現在の results を指さない。** 記録されて
+  いるのは登録したワーカーのスクラッチ (`/home/TUGRIP/tarot-pipeline/orch_results/
+  <job>` や相対パスの `orch_results/<job>`) で、解析後に NAS へアーカイブされる。
+  これを既定の参照先にしていたため **全 808 行が「解決できない」で 0 件更新**に
+  なった。しかも exit 0・エラー無し・`書き込み完了 0 行` で、**成功と区別が
+  付かない出力**になる (#29.1)。DB パスから `{account}/results` を構造的に
+  導出すること。CLAUDE.md #35 の「NAS に書くパスを実行環境に依存させない」の
+  読み出し側の版。
+- **`--skip-existing` と `--shard i/N` を併用しないこと。** 各シャードが
+  「まだ結果が無い検体」を数え直してから 3 分割するので、後から到達した
+  シャードほど候補が縮み、**その 1/3 しか担当しない**。実測 1,112 検体中
+  **263 件が誰の担当にもならず**、同時にシャード間で担当が重複した
+  (ログの PASS 合計 517 に対し実ファイル 346)。分散するなら分割は 1 回だけ
+  全員同じリストに対して行うか、分散をやめて 1 台で流す。
+- **進捗ログを `tail -N` に通さないこと。** 失敗した検体名が捨てられ、
+  `error 1` という件数だけが残って追跡不能になった。
+- DB を書き換える backfill は **`register_plasmids_to_db` と同じ `index.lock` を
+  取り、ロックを取ってから index を読み直す**こと。dry-run 時点の行をそのまま
+  書き戻すと、その間に登録された行が消える。
+
+#### そのほか守った点
+- `parse_pmlst` は `mob_suite` / `molecule` / `plasmidfinder` を **input に取る**
+  (params ではなく)。文脈が未確定のまま読むと MOB クラスタ未解決で確定してしまう
+  (#35 の「登録先は後から変えられない」と同型)。同じ理由で
+  `register_plasmids_to_db` の input にも `pmlst_result.json` を足した —
+  登録行は FASTA が変わらない限り更新されない (#42.5) ので、間に合わないと
+  空欄のまま永久に残る。
+- スキーム一覧は **`pmlst_db/config` を読む** (8 スキーム: incac / incf / inchi1 /
+  inchi2 / inci1 / incn / pbssb1-family / **shigella**)。コードにハードコードしない。
+- Pass 0 の閾値 (identity 90 / coverage 0.4) は **CGE のアリルコール閾値
+  (0.95 / 0.6) とは役割が違う**ので別に持つ。候補を絞るだけで型は CGE が決めるため
+  意図的に緩い。取りこぼすとプラスミドが丸ごと無言で消える。
+- アリルが複数 HSP に割れても被覆を過小に見ないよう、**クエリ区間を和集合にしてから**
+  被覆を出す (断片化アセンブリ対策)。
+- **`--rerun-triggers` も引数を貪欲に取る。** #28.3 に書いた `--allowed-rules` /
+  `--config` と合わせて **3 つとも貪欲**なので、ターゲットの直前は引数 1 個の
+  オプション (`--cores N`) で終えること。末尾に置くとターゲットのパスを食べて
+  `invalid choice` で落ちる。
+**該当ファイル**: `workflow/scripts/run_pmlst.py` (実行ドライバ・判定はしない),
+`workflow/scripts/classify_pmlst.py` (**判定の単一の真実源**。`build_result` /
+`read_pmlst_output` / `pmlst_for_cluster`), `workflow/rules/stage1_pmlst.smk`,
+`workflow/tests/test_pmlst.py` (fixture は実出力そのまま),
+`workflow/scripts/backfill_pmlst.py` (dry-run 既定・`--shard i/N` で LPT 分散),
+`workflow/scripts/backfill_plasmid_pmlst.py` (DB 列の後追い),
+`workflow/scripts/register_plasmids_to_db.py` (`index_fieldnames`,
+`_ensure_index_header` の移行, `pmlst_scheme` / `pmlst_type`),
+`workflow/scripts/per_sample_report.py` (`_build_pmlst_section`),
+`config/config.yaml` の `pmlst` セクション,
+`api/services/result_parser.py` (距離マップノードに pMLST),
+`frontend/src/components/PlasmidProfileSection.tsx` (**独立カードにせず
+Plasmid & Replicon Map の Replicon 列の右隣に `pMLST` 列として置く**。
+同じ「プラスミド 1 本」を指す情報なので表を分けない。表に載らない
+「検査不能 / 未設定 / 型が付かなかったレプリコン」は `PmlstNotes` が
+表の直下に出す — ここを削ると #28 の無言の偽陰性に戻る。
+**セルの書き分けは htmlExport の `pmlstCellHtml` と同一にすること**),
+`frontend/src/components/PlasmidDistanceMap.tsx` (`pmlst` 軸),
+`frontend/src/lib/htmlExport.ts` (`renderPmlst`)
