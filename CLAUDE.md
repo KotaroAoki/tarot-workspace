@@ -2751,3 +2751,163 @@ MOB-suite / Bakta / PlasAnn / integron / molecule_classification の座標が全
 `workflow/tests/test_concatemer.py` (新規), `workflow/rules/stage1_flye_assembly.smk`,
 `config/config.yaml` / `config/config.multiserver.yaml` の `concatemer_*`,
 `frontend/src/lib/plasmidMap.ts` (`copies` が小数になったので表示側で丸め)
+
+### 49.1 blastn の探索が bare name を弾いて、19 検体が静かに k-mer 検証へ落ちていた
+`concatemer_core.find_blastn()` は
+`return cand if os.path.exists(cand) else None` だったため、config の既定値
+`blastn` (バイナリ名) に対して `os.path.exists("blastn")` が常に偽になり
+**None を返していた**。#49 の実装直後に再解析した 19 検体はこれで
+`verification=kmer` で走っており、blastn を前提に緩めた閾値だけが効いていた。
+**そのために blastn を導入したのに、その blastn が一度も呼ばれていなかった。**
+`os.sep` を含むときだけパスとして扱い、含まなければ `shutil.which()` を引く。
+解決できなかったときは**警告を出す** (`params.blastn_requested` /
+`blastn_resolved` をレポートに残す) — 静かに k-mer へ落ちるのが最悪。
+**実機での確認方法**: `concatemer_report.json` の `params.blastn_resolved` が
+絶対パス (`/opt/mambaforge/envs/py39/bin/blastn`) になっていること。
+実測 2026-09-07 の 17576 で確認済み (5 contig 縮約 / skip 0 / 警告 0)。
+なお同検体の `contig_7` の単量体 3,861 bp は **16656 由来のクラスタ AD996 の
+登録単量体長と完全一致**しており、別アセンブリによる裏づけになっている。
+
+### 49.2 菌種同定の「実行失敗」と「参照 DB に無い」を分ける
+**発端**: 17576 の菌種が Unknown のまま出力されていた。モジュール障害を疑ったが
+**参照 DB の収載漏れ**だった (旧 DFAST typestrain 12,751 株に
+`Citrobacter bitternis` が 0 件。DFAST 本家は ANI 91.65% で当てていた)。
+当時の実装は両者を区別できず、利用者が「再解析すれば直るのか」を判断できない。
+
+**入れた区別 (3 値)**:
+| status | 意味 | 利用者の取るべき行動 |
+|---|---|---|
+| `PASS` | 菌種確定 | — |
+| `no_reference` | **mash は正常終了**したが同一性の下限を超える参照が 0 件 | **再解析しても変わらない**。DB への収載が必要 |
+| `unavailable` | mash 自体が失敗 (DB 不在 / timeout / 非ゼロ終了) | 再実行で直りうる |
+
+- `run_mash_screen.py` は `_write_result()` を**唯一の書き出し口**にして必ず
+  `status` を書く。DB 不在・timeout・非ゼロ終了は FAIL、ヒット 0 件は明示的に
+  警告を出す (#28: 無出力を陰性として通さない)。
+- **ヒット 0 件のときだけ同一性を 0.7 まで緩めて再試行**し、得た候補は
+  `fastani_candidates` としてのみ渡す (`top_lines = [] if relaxed_used else ...`)。
+  **菌種の判定基準は緩めない** — 緩めた候補をそのまま菌種名にすると、
+  遠縁を平然と菌種として報告することになる。
+- **`species_status` は `top_hits` の有無ではなく `mash_status` で決めること。**
+  空ヒットで分岐すると `no_reference` が `unavailable` に落ち、
+  「再解析しても無駄」という最も重要な情報が消える (実測で踏んだ)。
+
+**mash も菌種境界未満では菌種名を付けない** (`MASH_SPECIES_IDENTITY = 0.95`)。
+`assess_confidence_mash` は `(conf, label, species)` を返し、0.95 未満では
+`species=None`。これが無いと `integrate_confidence` の最終分岐
+(`mash_species or fastani_species or "Unknown"`) が拾ってしまい、
+新 DB 切替後の 17576 が **mash 同一性 0.9286 (実 ANI 91.65% = 別種) で
+「Citrobacter bitternis (LOW)」と断定**するところだった。
+**変更前に影響を実測すること** — NAS 全 824 検体を調べ、0.95 未満の mash から
+菌種名が付いていた検体は **0 件**であることを確認してから入れた。
+
+**DFAST 相当の報告にする**: 菌種が確定しなくても
+`nearest_relative` (菌種 / ANI / 整列率) と
+「未記載種、または参照 DB に収載されていない菌種の可能性があります」を出す。
+FastANI 側も `species_threshold` 未満では `species_assignment` を付けず
+`below_threshold` に落とす。**「該当なし」で終わらせない** — 実測 17576 は
+新種を示唆する所見であり、そこに情報がある。
+
+**該当ファイル**: `workflow/scripts/run_mash_screen.py` (`_write_result`,
+`MASH_MIN_IDENTITY` / `MASH_RELAXED_IDENTITY`),
+`workflow/scripts/merge_species_id.py` (`MASH_SPECIES_IDENTITY`,
+`assess_confidence_mash`, `species_status`, `nearest_relative`),
+`workflow/scripts/run_fastani.py` (`below_threshold`),
+`workflow/scripts/per_sample_report.py` (`_build_species_section`),
+`frontend/src/pages/SampleDetail.tsx`, `frontend/src/lib/htmlExport.ts`
+
+### 49.3 タイプ株 DB の更新 (2026-09-04, 12,751 → 20,704 株)
+**動機**: #49.2 の収載漏れ。ツールは `tools/update_typestrain_db.py`
+(`fetch-list / convert / plan / download / sketch / all`)。**稼働中の DB は
+一切触らず**、新しいディレクトリに作って config 3 行で切り替える。
+
+- **参照リストは `references.db` (SQLite/peewee) から作る。**
+  `dqc_reference_compact_latest.tar.gz` に `reference_genomes.tsv` は
+  **入っていない** (あれは `dump_sqlite_db` が生成するもの)。2 GB を落とし直す
+  羽目になったので tarball はキャッシュし、目的のメンバが無いときは
+  **tar の中身を列挙して出す**。
+- **1 種 1 株に絞る** (`--dedupe-by-species`, `_TYPE_PRIORITY`)。ユーザー決定。
+- **NCBI は並列に厳しい。** 再試行なし + 8 並列で **8,488 件中 2,374 件 (28%)
+  が失敗**した。指数バックオフ + ジッタ、404 は即中断、`--jobs 4` に落として
+  再実行したら**失敗 0**。失敗の種類別内訳をログに出すこと。
+- **`mash info` のパースを `split(":")[-1]` でやらない。**
+  `"21 (64-bit hashes)"` が返る。しかも `"hashes" in low` は K-mer 行にも当たる。
+  ヘッダ部分に限定して最初の整数を正規表現で取る。
+- **既存スケッチの k/s を読めなかったら止める** (推測で作り直すと既存 DB と
+  互換性の無い sketch ができる)。ゲノムの 5% 以上が欠けていても止める。
+- **切替前に `tools/compare_typestrain_dbs.py` を必ず通す。**
+  preflight で `shutil.which(mash)` と
+  **「sketch の件数 == CSV の行数」**を検査する (書きかけの `.msh` を掴むのを防ぐ)。
+  分類は 一致 / 最上位が変化 / 新たに同定 / **同定できなくなった**。
+  実測 (NAS 全 51 検体): 43 / 7 / 1 / **0**。
+- **`fastani.genome_dir` は変えない。** 新規ゲノムは共有プールに追加するだけ。
+  実測で新 CSV 20,704 株のうちプールに無いのは 43 件 (0.21%) で、
+  `run_fastani` は欠落を WARNING に出すので無言の欠落にはならない。
+- **CSV のヘッダは旧版と同一に保つこと** (`accession,taxid,species_taxid,
+  organism_name,strain,category_of_type,validated,rank`)。ローダは
+  `accession` / `organism_name` / `strain` を名前で引くので、列名が変わると
+  `acc_map` が空になり **#24 と同じ形で静かに菌種名が消える**。
+  切替時は実物の CSV を `load_accession_map` / `load_metadata` に通して
+  件数が CSV 行数と一致することを確認する。
+- **菌種名が実際に変わる検体がある** (実測 7 件: *S. marcescens* → *S. nevei*、
+  *E. asburiae* → *E. dykesii*、*E. kobei* → *E. chuandaensis* / *bugandensis*、
+  *E. coli* → *Shigella boydii*)。解析結果は不変で表記だけだが、過去レポートと
+  食い違う。下流への波及は確認済み: Shigella は `genus_aliases` が、
+  Serratia / Enterobacter は `genome_size_map` の属フォールバックが吸収し、
+  cgSNP の `species_dir` は属内スキームが単一なので分岐しない。
+- **菌種同定を作り直すのに再アセンブリは要らない** (#28.3 と同じ):
+  `--allowed-rules mash_screen fastani_species_id merge_species_id`。
+
+**該当ファイル**: `tools/update_typestrain_db.py` (新規),
+`tools/compare_typestrain_dbs.py` (新規),
+`config/config.yaml` / `config/config.multiserver.yaml` の
+`species_id.mash.sketch_db` / `.metadata_csv` / `species_id.fastani.metadata_csv`
+
+### 50. 壊れた入力 FASTQ は「アップロードの時点」でしか確実に弾けない
+**症状 (実測 2026-09-07)**: 17576 の再解析が flye ルールで失敗。巨大なシェル
+ダンプの中で実際の失敗は 1 行だけだった:
+`unpigz: skipping: ...: corrupted -- incomplete deflate data`。
+`set -euo pipefail` 下なので unpigz の異常終了で即中断し、Flye には到達していない。
+**パイプラインのバグではなく、入力ファイルが壊れていた。**
+
+**壊れ方**: 7/14 11:54 のアップロードが **92% (1,581,023,232 /
+1,714,644,403 バイト) で切れて**いた。16:39 に上げ直した完全版も NAS にある。
+
+**なぜ 2 か月気づかなかったか — 重複検知はサイズしか見ない。**
+`_find_dedup_match` は「セッション ID を除いた相対パスの完全一致 + サイズ一致」で
+判定し、一致したら実体を送らず **symlink を張る**。同じ壊れたローカルファイルを
+上げ直すたびに破損実体へリンクされる。**受け入れてしまうと以降はサイズしか
+手掛かりが残らない** (中身の一致まで見るには走査した既存ファイルを全部
+リモートで読む必要があり非現実的)。7/14 16:48 と 9/4 の解析はたまたま
+正常な実体にリンクされて成功しており、**同じ検体が成功したり失敗したりする**。
+
+**入れたガード (2 段)**:
+1. **アップロード時** — `GzipStreamCheck` がステージングの書き込みループに
+   相乗りして gzip ストリームを検査する (**ファイルを 2 度読まない**)。
+   壊れていれば staging を破棄し `errors` に理由を載せる (フロントは
+   `dropzone__errors` で表示済み)。判定は `gzip -t` と一致させてある
+   (末尾 NUL 詰めは "trailing garbage ignored" = 正常扱い)。
+   pigz / bgzip の**多メンバ gzip** に対応するため、メンバ終端 (`eof`) ごとに
+   `decompressobj` を作り直すこと — 単一メンバ前提だと 2 個目以降を検査できない。
+   **性能は問題にならない**: 実測 CPU 340 MB/s に対し NAS/回線は約 100 MB/s
+   なので常に I/O 律速 (1.7 GB で +5 秒程度)。zlib は展開中に GIL を解放するので
+   `asyncio.to_thread` でイベントループを空ける。`TAROT_VERIFY_GZIP_UPLOAD=0` で無効化可。
+2. **flye ルール** — `unpigz` の終了コードを明示的に見て、GUI のログパネルに
+   届く形で「入力ファイルが壊れている / **アセンブラの問題ではない**」と言い切る。
+   空ファイルとリンク切れ symlink も同じ形で弾く (`[ -s ]` はリンクを追跡する)。
+   アップロードを経由しない経路 (パス直指定・dorado 出力) はここだけが守る。
+
+**読めたところまでで続行しないこと。** unpigz は壊れる直前までは正常に展開できて
+しまうので、`|| true` で流すと **92% のリードで黙って組み上がる**。
+アセンブリは成立するので誰も気づかず、小型プラスミドの回収だけが静かに劣化する
+(#28 と同じ趣旨で、こちらは「陰性」ではなく「劣化した陽性」として出る)。
+
+**運用上の注意**: 破損実体は NAS に残る。新しいガードで新規アップロードからは
+到達できなくなったが、**既存の破損実体を指す symlink は張られたまま**なので、
+失敗したジョブを直すときはリンク先を `readlink` で確認し、健全な実体へ
+`ln -sfn` で張り替える。判定は必ず **`gzip -t` の実行**で行うこと —
+サイズが「それらしい」ことは何の保証にもならない (今回の実体は 1.5 GB あった)。
+**該当ファイル**: `api/routers/upload.py` (`GzipStreamCheck`, `_is_gzip_name`,
+`VERIFY_GZIP_UPLOAD`, ステージングループ),
+`api/tests/test_upload_gzip_check.py` (新規),
+`workflow/rules/stage1_flye_assembly.smk` (リード結合ループ)
