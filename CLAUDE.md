@@ -3119,3 +3119,62 @@ Plasmid & Replicon Map の Replicon 列の右隣に `pMLST` 列として置く**
 **セルの書き分けは htmlExport の `pmlstCellHtml` と同一にすること**),
 `frontend/src/components/PlasmidDistanceMap.tsx` (`pmlst` 軸),
 `frontend/src/lib/htmlExport.ts` (`renderPmlst`)
+
+### 52. contig 名の突合キーは「ヘッダ全体」ではなく最初のトークンで作る
+**症状 (実測 2026-09-07, harada_ndm/03_GD33_GCA_018966845)**: Plasmid & Replicon Map で
+**環状レプリコンを入力しているのに全行が `No AMR genes`** になり、代わりに
+同じ contig 名の行が `未対応 (unknown)` として下にもう一組並び、そちらに
+AMR 遺伝子が全部載っていた。モジュールの失敗ではなく **frontend の突合キーのバグ**。
+
+**原因**: `contigKey` (frontend) / `contig_key` (workflow) が **FASTA ヘッダ全体**に
+`(contig|tig|node|scaffold)[_-]?0*(\d+)` をかけていた。公共アセンブリ
+(`assembly_complete` / WGS 由来) では 2 通りに壊れる:
+1. **説明文ごとキーになる。** `CP076646.1 Escherichia coli strain GD33 chromosome,
+   complete genome [topology=circular]` は正規表現に当たらないので、丸ごと
+   小文字化されたものがキーになる。一方 **AMRFinder / blast 系は contig 名を
+   最初の空白で切る** (`CP076646.1`) ので必ず外れる。MOB-suite の contig_report・
+   `molecule_classification.json`・PlasmidFinder は完全なヘッダを持つため
+   **それら同士は一致し、AMR だけが孤立する** = 「分子はあるが AMR 0 件」の行と
+   「未対応だが AMR あり」の行に二重化する。#42 で `contig_match_key` を作って
+   carbapenemase の抽出だけは直してあったが、**`contig_key` 本体は直していなかった**。
+2. **別々の contig が同じキーに衝突する。** WGS レコードの説明文には元アセンブラの
+   名前が残る (`MVPP01000003.1 Salmonella ... contig_3_1, whole genome shotgun
+   sequence`)。全体を検索すると `contig_3_1`〜`contig_3_4` が全部 `contig_3` に
+   潰れ、**異なるアクセッションが 1 行にまとまる** (実測 toho_micro_id_temp の
+   3 検体で最大 27 件)。1 の方が目立つが、**こちらの方が危険** (別分子の
+   AMR/レプリコンが混ざる)。再判定 contig の表示名 (`contigShortName`) も
+   説明文中の `NODE_165` を採っていた。
+
+**解決**: `contigKey` / `contig_key` とも **先に最初のトークンだけにしてから**
+正規化する。`contig_match_key` はこれで `contig_key` の別名になった (呼び出し側と
+意図表示のために残してある)。`compare_plasmid_structure.py` の写しも同期すること
+(`workflow/tests/test_compare_plasmid_structure.py` が正本との一致を検査する)。
+
+**規模 (NAS 全 1,111 検体を実際に走らせて計測)**: 328 検体が変化
+(toho_micro_id_temp 300 / harada_ndm 28)。**「未対応」行 1,567 → 0、そこに
+取り残されていた AMR 遺伝子 4,709 → 0**。残り 783 検体 (Flye / SPAdes の素の
+ヘッダ) は完全に不変で、分子判定・レプリコン・pMLST の割り当ても変わらない。
+**表示は再解析不要** — この画面は生モジュール JSON から frontend が組み立てる。
+workflow 側の `contig_key` 修正が既存出力に反映されるには再解析が要るが、
+キー衝突が実際に起きていたのは 3 検体だけ。
+
+**検証の型 (ログイン不要で本番コードを実データに当てる)**: `vite build --ssr` で
+一時エントリを束ねて node で走らせ、`buildPlasmidMap` / `buildPlasmidMapRows` を
+**本番のまま** NAS 全検体に適用して修正前後を差分比較した (#45.6 のハーネスと
+同じ趣旨で、こちらは純関数なので DOM も不要)。差分は「行数・unknown 行数・
+contig ごとの AMR/レプリコン件数・分子割り当て」を機械的に比較し、
+**AMR 総数が保存されていること**と**分子割り当てが変わらないこと**を全数で確認する。
+修正前を再現してから直すこと — 再現していなければ、直したのが症状の原因とは限らない。
+
+**教訓**:
+- **ヘッダの説明文を正規表現にかけないこと。** 説明文は自由テキストで、
+  他のアセンブラの contig 名も菌種名も入っている。突合キーは必ず先頭トークンから。
+- **同じ問題に別名の関数を足して片側だけ直さないこと** (#42 の `contig_match_key`)。
+  正本を直せば別名は自然に消える。frontend / workflow / 写しの 3 か所が
+  同じ正規化を持つ以上、**直すときは 3 つとも**。
+- 「表が二重に並ぶ」「同じ contig が 2 行ある」は突合キーが外れている合図。
+  片方が空 (`No AMR genes`) になるので、**陰性と読める**のが厄介 (#28 と同型)。
+**該当ファイル**: `frontend/src/lib/plasmidMap.ts` (`contigHead`, `contigKey`,
+`contigShortName`), `workflow/scripts/circularity_util.py` (`contig_key`,
+`contig_match_key`), `workflow/scripts/compare_plasmid_structure.py`
+(`_fallback_contig_key`), `workflow/tests/test_carbapenemase_extraction.py`
