@@ -3178,3 +3178,249 @@ contig ごとの AMR/レプリコン件数・分子割り当て」を機械的�
 `contigShortName`), `workflow/scripts/circularity_util.py` (`contig_key`,
 `contig_match_key`), `workflow/scripts/compare_plasmid_structure.py`
 (`_fallback_contig_key`), `workflow/tests/test_carbapenemase_extraction.py`
+
+### 53. シンプルビュー + A4 1 枚レポート — 画面と PDF は同じ部品で描く
+**動機**: 検体詳細は専門家向けの全部載せで、非専門家 (ICT / 検査部 / 主治医) が
+1 画面で拾える形が無かった。A4 1 枚の PDF も欲しい。**新規の解析も API 変更も
+不要**で、材料は `{sample}_report.json` と既存エンドポイントに全部あった。
+
+**判定は `frontend/src/lib/sampleBrief.ts` のみが行う** (純関数)。画面
+(`SampleBriefView`) も A4 HTML (`briefReport.ts`) も結果を描くだけ。
+**A4 側を文字列テンプレートで書き直さないこと** — `htmlExport.ts` のような
+別実装にすると、片方を直したときにもう片方が古いまま残る (#19 / #42 と同型)。
+実装は**同じ React コンポーネントを `renderToStaticMarkup` で静的レンダリング**し、
+レイアウトの差 (画面 = 横 3 カラム / A4 = 縦 2 カラム) は `data-variant` で
+`grid-column` / `grid-row` を差し替えるだけにしてある。
+
+#### 実測で決めた値 (勘で変えないこと)
+- **画面のフォントは `clamp(12.5px, 0.95vw, 15px)`。** 1280×720 で NAS 全 1,111
+  検体 + 合成 3 件を測ると **12.5px は溢れ 0 件 / 13px は 7 件が溢れる**。
+  1440 で 13.7px、1920 で 15px。
+- **A4 は薬剤耐性ブロックを全幅に置く。** 半幅に置くと遺伝子の行が折り返して
+  倍の高さになり、最も重い検体が 277.6mm (紙をはみ出す)。全幅にすると 270.4mm。
+  **グリッドの行の高さは「その行でいちばん高いブロック」で決まる**ので、
+  高いブロックと低いブロックを同じ行に並べると低い側の余白が丸ごと無駄になる。
+- 全 1,111 検体が A4 **1 枚**に収まる (最大 270.4mm / 上限 277mm)。
+
+#### 情報を減らす画面ほど「検査不能」が「陰性」に化ける (#28 / #40 の UI 版)
+- `notAssessed` (判定できなかった項目) を**常設ブロック**にし、空でも
+  「該当なし」と書いて消さない。「該当なし」と書いてあること自体が
+  「調べた結果ゼロだった」の証拠になる。
+- **`overflow: hidden` で溢れを隠さないこと。** 想定より小さいウィンドウで
+  内容が黙って切り落とされ、この常設ブロックごと消える。`auto` にして
+  スクロールさせる。**表示件数の上限はデータ側 (`sampleBrief.ts`) で決め、
+  超過は必ず「他 N 件」と件数を出す。**
+- 「対象外 (`notApplicable`)」と「検査不能 (`notAssessed`)」を別配列で持つ。
+  実データでは salmonella_typing skipped が 757 件あり、混ぜると本物の
+  検査不能が埋もれる。
+- **モジュール API の 404 は「未実施」であって「取得失敗」ではない。**
+  `ApiError.status` で判別する。取り違えると「まだ実施していない」が
+  「読めなかった」に化ける。`PlasmidProfileSection` は
+  `.catch(() => null)` で握り潰しているので**そのクエリを流用せず別キーで持つ**。
+
+#### 実データを見て初めて分かったこと
+- **EFFLUX を耐性一覧に並べてはいけない。** 実測 10,219 件中 **2,834 件が
+  EFFLUX で最多**だが、中身は `emrD` / `acrF` / `mdtM` / `mdsA` / `mexA` など
+  **その菌が元から持つ染色体性のポンプ**。獲得耐性と同列に出すと本当に見るべき
+  遺伝子が埋もれる。**件数だけは残す** (黙って捨てない)。
+- **推定薬剤をアルファベット順に並べてから切ってはいけない。** 実測で薬剤名は
+  中央値 9 剤・最大 55 剤。名前順で 12 剤に切ると Amikacin / Amoxicillin /
+  Ampicillin … と A と C だけが残り「セフタジジムは?」が消える
+  (#21 の Bakta が名前順 100 件で切って MLST 座位を落とした件と同型)。
+  **裏づける遺伝子の数が多い順**に並べる。
+- **`rep_cluster_NNNN` を「レプリコン型」として並べない** (#19)。curated な
+  Inc 型ではなく MOB-suite 内部のクラスタ ID。件数だけ添える。
+- **cgSNP の `group` は新しい実行にしか無い** (実測 548 件中 51 件)。
+  無ければ `ST` に落とす — 群が出ないと「何と比べた距離か」が読めない。
+- `dec_alerts.alerts[]` は workflow が **`title_ja` / `detail_ja` / `label_ja` を
+  既に日本語で持っている**。所見の文面はこれをそのまま使う (#33: 判定式も
+  文面もフロントで書き直さない)。
+- `checkm2.thresholds` / `read_qc.min_depth_warn` は**レポートの中に閾値が
+  入っている**。画面側に書き写すと、パイプラインが閾値を変えたときに
+  古い基準で色を塗る。
+
+#### 踏んだ罠 (ツール側)
+- **`npx tsc` (RTK 経由) が、実際にはエラーがあるのに
+  「TypeScript: No errors found」と報告した。** 実際
+  `./node_modules/.bin/tsc --noEmit -p tsconfig.app.json` を直接叩くと
+  `TS2339: Property 'href' does not exist` が 2 件出た。
+  **型チェックは必ず `./node_modules/.bin/tsc` を直接実行すること。**
+- **テンプレートリテラル (CSS 文字列) の中にバッククォートを書かない。**
+  コメントに「\`hidden\` にしないこと」と書いた 1 文字で `BRIEF_CSS` が
+  途中で閉じ、Vite が 500 を返して画面が真っ白になった。tsc は通る。
+- **`react-dom/server` を静的 import すると初期バンドルが +57 KB (gzip 実測)。**
+  ボタンを押したときだけ読む動的 `import()` に分ければ初期バンドルは ±0。
+- **フックは早期 return より前に置く** (#44 / #46.3 で 3 回目)。
+
+#### 検証の型 (ログイン不要)
+1. `vite build --ssr` で一時エントリを束ね、node から `buildSampleBrief` と
+   `buildBriefReportHtml` を **NAS 全 1,111 検体の実レポート**に当てる
+   (例外 0 / `notAssessed` が常に配列 / 「検査不能なのに陰性」0 を機械的に走査)。
+2. 実 DOM は `frontend/__verify/screen.html` + Vite dev サーバで
+   **本番のコンポーネントを props 直叩き**。ログイン不要。
+   **測定器が実際に発火するかを先に確かめること** — 900×480 に縮めて
+   15 件すべてで溢れ検出が出ることを確認してから、1280/1440/1920 を測った。
+   これをやらないと「0 件」が「検出できていない」なのか区別が付かない。
+3. `#root` の `scrollHeight` を見ても溢れは分からない (子の `.brief` が
+   `height:100%` で埋めるため)。**`.brief` 自身**と各ブロックで測ること。
+**該当ファイル**: `frontend/src/lib/sampleBrief.ts` (新規・判定の単一の真実源),
+`frontend/src/lib/briefStyles.ts` (新規), `frontend/src/lib/briefReport.ts` (新規),
+`frontend/src/lib/printHtml.ts` (新規),
+`frontend/src/components/SampleBriefView.tsx` (新規),
+`frontend/src/pages/SampleDetail.tsx`, `frontend/src/index.css`,
+設計の意図は `PLAN_simple_view_a4_report.md`
+
+### 53.1 ResFinder の抗菌薬ごとの推定は全検体で壊れている (別件)
+`workflow/scripts/parse_resfinder.py` が `pheno_table.txt` を
+`csv.DictReader` にそのまま渡しているが、実ファイルは**先頭 16 行がコメント**で
+本物のヘッダ (`# Antimicrobial	Class	WGS-predicted phenotype	Match	…`) は
+その後にある。結果 `amr_gene_profile.phenotype_predictions` は
+**全 1,111 検体でコメント文字列の羅列**になっている (実測 10671 で 106 行)。
+**被害は出ていない** — このフィールドを読む画面もエクスポートも 1 つも無く、
+Results の `resfinder_phenotypes` 列は別経路 (`acquired_genes[].phenotype`) で正常。
+ただし #28 の「パースはしているが誰も見ていないので壊れていても気づかない」構造そのもの。
+**ResFinder の再実行は不要** (`pheno_table*.txt` は NAS に全検体分残っている。
+実測 kaoki_stec 525 検体に 1,042 ファイル)。修正すれば「抗菌薬ごとの
+Resistant / No resistance + Match (0-3)」が使えるようになり、#53 の
+「遺伝子型からの推定」の粒度が上がる。
+
+### 54. 遺伝子名の表記 (イタリック / 下付き) — 規則は 1 箇所、当てるのは記号の形をしたものだけ
+**要件**: 細菌の遺伝子記号はイタリック。β-ラクタマーゼは酵素ファミリー名を
+下付きにする (`blaIMP-1` → *bla*<sub>IMP-1</sub>)。タンパク質のアミノ酸置換
+(S83I) と rRNA の呼称 (16S) は立体。
+
+**判定は `frontend/src/lib/geneName.ts` (純関数) のみが持つ。** 描画側は
+`components/GeneName.tsx` (React) / `geneNameHtml()` (HTML 文字列) /
+`geneNameTspans()`・`GeneNameTspans` (SVG) を通すだけ。3 通りの出力先が
+あるので**表記規則を描画側に複製すると必ず食い違う** (#19 / #42)。
+DOM に依存しないので、実データの全遺伝子名に当てて機械的に検証できる。
+
+#### 実データを見てからでないと決められなかったこと
+- **`blaI` / `blaR1` / `blaZ` は下付きにしない。** ブドウ球菌 bla オペロンの
+  構成遺伝子で酵素ファミリー名ではないため、慣例上ふつうのイタリック。
+  NAS 全 1,111 検体の `bla*` 157 種を目視して確定した 3 件で、残り 154 種は
+  すべて酵素ファミリー (ACT / CTX-M / IMP / NDM / OXA / PDC / SHV / TEM …)。
+- **ABRicate の遺伝子名には末尾にヒット連番が付く** (`blaNDM-5_1` / `sul3_2` /
+  `qnrS1_1`)。`_` の右を無条件に「変異」とみなすと
+  **「*bla*<sub>NDM-5</sub> 1」**になる (実際に出した)。
+  変異の判定は **「大文字 + 数字」で始まること**を要求する
+  (`S83I` / `C1192T` / `T21insTer10` は通り、`1` は通らない)。
+- **CARD / MEGARes の名前は遺伝子記号ではなく説明句。**
+  `Escherichia_coli_ampC_beta-lactamase` / `PC1_beta-lactamase_(blaZ)` /
+  `Klebsiella_pneumoniae_KpnE` / `stx2a_operon` が 300 種以上ある。
+  全体をイタリックにすると誤り (菌名は斜体でも "beta-lactamase" は立体)。
+  **推測で組むより触らない方がよい** — 記号の形
+  (`^[A-Za-z][-A-Za-z0-9()'’Δδ./+]*$`) をしていないものは立体のまま出す。
+- **記号自身の括弧と注記の括弧を区別する。** `tet(B)` / `aac(6')-Ib` /
+  `aph(3'')-Ib` は括弧の中に空白も注記語も無い。`sul3(3' end)` /
+  `3'-CS(partial)` だけを分ける。
+- **最初の調査で ABRicate を見落とした。** AMRFinder + インテグロンだけを
+  数えて 647 種と思っていたが、ABRicate / CARD / MEGARes / VFDB を入れると
+  **2,344 種**で、上の 2 つの罠はそちらにしか無い。
+  **表記規則を作るときは「その名前が出てくる全モジュール」を数えること。**
+
+#### 検証の型
+**「文字が落ちていない / 増えていない」を全数で機械的に確かめる。**
+`genePartsText(geneNameParts(n)) === n` を 2,344 種すべてで検査する
+(例外は点変異の `_` → 空白のみ。これは AMRFinderPlus の列区切りであって
+記号の一部ではない。元の識別子は `title` 属性に必ず残す)。
+分類の内訳 (italic / italic+sub / plain …) も出して目視で確かめる。
+
+#### 適用範囲 (2026-09-08 時点)
+入っているのは **HTML と SVG のテキスト**: シンプルビュー / A4 レポート、
+詳細ビューの AMR・毒力・PAI・セフィデロコル表と MLST アリルプロファイル、
+DEC アラートカード、インテグロンカード (表 + 図)、Genome Map
+(carbapenemase ラベル + ツールチップ)、詳細 HTML 出力 (表 + インテグロン図)。
+**SVG では `<i>` / `<sub>` が使えない**ので `<tspan font-style="italic">` と
+`<tspan font-size="0.72em" dy="0.22em">` で組む。下付きは末尾に来るので
+`dy` を戻す必要はない。**図のラベルは幅を実測していない**ので tspan 化しても
+配置は変わらない (実測で確認済み)。
+**下付きは `line-height: 0; vertical-align: baseline; position: relative`
+で組むこと** — 素の `<sub>` は行の高さを押し広げ、表の行が 1 行ぶん高くなり、
+A4 1 枚と 1 画面の高さ計算 (#53) が狂う。
+**該当ファイル**: `frontend/src/lib/geneName.ts` (新規・単一の真実源),
+`frontend/src/components/GeneName.tsx` (新規),
+`frontend/src/components/SampleBriefView.tsx`, `frontend/src/lib/htmlExport.ts`,
+`frontend/src/pages/SampleDetail.tsx`, `frontend/src/components/DecAlertsCard.tsx`,
+`frontend/src/components/IntegronCard.tsx`, `frontend/src/components/GenomeMap.tsx`,
+`frontend/src/index.css`
+
+### 55. 距離マップの MST は DCJ 0 を 1 ノードにまとめる — 「まとめる」は近似ではない
+**動機**: Genetic Distance Map (DCJ-Indel MST) は距離 0 のプラスミドを**長さ 0 の
+枝**で結んでいた。実測 `toho_micro_id/AA002` は 35 ノード中 20 本が 1 つの DCJ 0 群で、
+その 20 本を 19 本の赤い太線が結んで図の中央が団子になっていた。しかも**その 20 本は
+11 菌種にまたがる** (全て IncL/M・全て blaIMP-1・サイズ 76,659〜76,662 bp) —
+「同じプラスミドが菌種を超えて広がっている」という**このパネル固有の結論** (#41) が
+線の束に埋もれていた。丸 1 個にまとめ、面積と円内の数字で件数、扇形で内訳を出す
+(GrapeTree / BioNumerics の MST と同じ様式)。
+
+**実データでの効果 (2026-09-10, NAS 全 8 アカウント / 地図 35 件)**:
+描画ノード **188 → 134**、まとめた群 22、**11 件の地図は全体が 1 群**になる
+(= 表示中が全部 DCJ 0)。pling で距離のあるプラスミド 188 本のうち **135 本 (72%)** が
+「DCJ 0 群を含む地図」に現れる。
+
+**判定は `frontend/src/lib/mstGrouping.ts` (純関数) だけが持つ** (#19)。
+d3 側は返ってきた群と枝を描くだけ。`enabled: false` でも同じ形 (全ノードが単独群) を
+返すので描画経路は 1 本のまま = トグル off で従来と**完全に同一の図**になる
+(実測で半径 10/14・ノード 35・枝 34 が一致)。
+
+#### まとめても木は変わらない (厳密)
+Kruskal は重み 0 の枝を必ず先に全部採るので、**0 の連結成分はそのまま 1 頂点に縮約
+でき、残る枝は成分をまたぐ最小重みの枝**になる。つまり折り畳んだ木は
+**元の MST から長さ 0 の枝を縮約したもの**そのもので、形も値も変わらない。
+だから群間距離は **最小値**を採る (平均でも代表ペアでもない)。
+全 35 地図で「元の MST の非 0 枝の重み多重集合 == 折り畳んだ MST」を機械的に確認済み。
+
+**ただし群間距離はメンバーによって違うことがある。** 実測 16 組
+(40 vs 42 / 33 vs 37 / 34 vs 39 など最大 5)。DCJ 0 は「pling が**そのペアの**ブロック
+分解で区別できなかった」という意味で、第三のプラスミドが相手だと分解が変わるため、
+三角不等式から期待される同値性はきっちり成り立たない。**`weight` (最小) と
+`weightMax` の両方を返し、幅があるときは枝ラベルを `DCJ 7–9` にする**
+(実測 AA739 でそう出ることを実ブラウザで確認)。これは異常ではないので警告にしない。
+
+#### 守ったこと
+- **DCJ 0 は「配列が同一」ではない。** 実測で群内のサイズが 3 bp 違う。ラベルは
+  「同一プラスミド」ではなく**「DCJ 0 (構造上区別できない)」**と書く (#28 と同じ趣旨)。
+- **統合するのは完全 0 クリークのときだけ。** 成分内に未計算 or 0 でないペアが 1 つでも
+  あれば**その成分は統合せず**、理由つきで注記に出す (実データでは 0 件だが、
+  推測でまとめない)。連結成分をそのまま信じないこと。
+- **群は「表示中のノードだけ」で作り直す** (MST を張り直すのと同じ理由)。メンバーを
+  1 本非表示にすると群が 20 → 19 に縮む (実測で確認)。
+- **単位をすり替えない。** 見出しの「35 プラスミド」も凡例の件数も**プラスミド単位の
+  まま**で、「(DCJ 0 でまとめて 9 群)」を添えるだけ。
+- **中心プラスミドは群に含める** (ユーザー決定)。「あなたの検体は他 19 本と区別
+  できない」が最も重要な所見のため。その群は太い自検体リング + 青いラベルで示し、
+  クリックは無効 (比較の起点そのもの)。
+- **ノードのクリックは代表 1 本との構造比較。** 代表は決定的に選ぶ
+  (中心 > 自検体 > 同バッチ > DB → サイズ大 → uid 昇順)。個別メンバーを選ぶ経路は
+  一覧表の「比較」ボタンが従来どおり持つ。一覧表には**群のラベル列**を足して
+  図のノードと同じ文字列を出す (図 ↔ 表を辿れるように)。
+- 出所リングは最も手前の出所、carbapenemase ハローは**一部保有なら破線 + `(2/3)`**
+  (過大表示しない)。混在の内訳は「色分け: 出所」の扇形とツールチップが持つ。
+- `onVisibleChange` が親に渡す uid は**全メンバーのまま** (構造比較スタックの意味を
+  黙って変えない)。
+
+#### 罠
+- **全体が 1 群になる地図が 11/35 件ある。** d3 effect の早期 return を
+  `visibleNodes.length < 2` のままにすると**何も描かれない**。頂点は群なので
+  `zg.groups.length < 1` で判定し、1 群のときは
+  「表示中の N 本はすべて DCJ 0」と**言葉でも出す** (これが一番はっきりした結論)。
+- **半径が可変になるので、当たり判定・collision・ラベルの dy・ハローを全部半径から
+  算出し直すこと。** 固定値のまま残すとラベルが円に食い込む。
+- **MOB フォールバック** (`member_basis='mob_primary_cluster'`) は枝が 1 本も無いので
+  統合も起きない。184 ノードの `AA345` はこれに該当し**この変更では改善しない**。
+- 菌種軸だけ `AxisSpec.unit` が `種` なので、そのままだとノードの副ラベルが
+  「11 種」になり見出しの「14 菌種」と食い違う。
+- 図の HTML エクスポートは距離マップを出力していないので対象外 (#41)。
+- **cgSNP の MST (`MstGraph.tsx`) にも同じ構造がある** (0 SNP のペア)。`mstGrouping` は
+  id/weight で汎用化してあるので後から乗せられる。今回は移植していない。
+
+**検証**: ① 本番の純関数を NAS 全アカウントの `pling_clusters.json` に当て、
+メンバー保存 / 決定性 / 0 クリーク性 / 群間枝の健全性 / MST の縮約一致 /
+`enabled:false` の同一性を全数検査 (エラー 0)。② `frontend/__harness.html` +
+`src/__harness.tsx` に AA002 / AA739 / 全 0 の 3 例を props 直叩きし、実 DOM で
+ノード数・扇形数・半径・件数テキストが円に収まること・**文字の重なり 0**・
+トグル往復・非表示連動・クリック先の代表・ツールチップを実測 (確認後に削除)。
+③ `./node_modules/.bin/tsc --noEmit -p tsconfig.app.json` を直接実行。
+**該当ファイル**: `frontend/src/lib/mstGrouping.ts` (新規・単一の真実源),
+`frontend/src/components/PlasmidDistanceMap.tsx`
