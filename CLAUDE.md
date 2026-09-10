@@ -3424,3 +3424,116 @@ Kruskal は重み 0 の枝を必ず先に全部採るので、**0 の連結成�
 ③ `./node_modules/.bin/tsc --noEmit -p tsconfig.app.json` を直接実行。
 **該当ファイル**: `frontend/src/lib/mstGrouping.ts` (新規・単一の真実源),
 `frontend/src/components/PlasmidDistanceMap.tsx`
+
+### 56. β-ラクタマーゼの機能型分類 — 材料は既にあり、罠は「NCBI の言葉づかい」の側にある
+**動機**: AMR Gene Profile は Ambler クラスも ESBL / カルバペネマーゼの別も出しておらず、
+利用者が `blaCMY-2` と `blaCTX-M-15` を区別できなかった。
+
+**材料は既に全レポートに入っていた。** AMRFinderPlus の `Element name`
+(`amrfinder.amr_genes[].sequence_name`) が NCBI のキュレート済みの
+Ambler クラスと機能型をそのまま持つ:
+`'extended-spectrum class A beta-lactamase CTX-M-15'` /
+`'subclass B1 metallo-beta-lactamase IMP-1'` / `'BlaEC family class C beta-lactamase'`。
+実測 (NAS 全 1,111 検体): β-ラクタマーゼのヒット **1,547 件すべてで
+Ambler クラスが取れ**、取れない 240 件は**ちょうど非酵素**
+(MecA / MecR1 / BlaI / BlaR1・ポーリン OprD / OmpK35 / OmpF・NalC・blaTEM プロモーター)。
+**再解析も backfill も不要**。判定は `frontend/src/lib/betaLactamase.ts` (純関数) のみが持つ。
+
+**罠 ① — "extended-spectrum class C" は ESBL ではない (最重要)。**
+NCBI は CMY-2 / DHA-1 / MOX-1 / PDC-3 を "extended-spectrum class C beta-lactamase"
+と書く。素朴に "extended-spectrum" で拾うと**プラスミド性 AmpC 34 件が ESBL に化ける**。
+**ESBL は class A / D に限り**、class C は「拡張基質型 AmpC (ESAC)」として別枠にする
+(阻害薬への応答が違うので治療選択が変わる)。
+
+**罠 ② — 内在性かどうかはファミリー名では決まらない。菌属とセットで持つこと。**
+実測で `blaCMY-2` は E. coli / S. enterica (獲得性)、`blaCMY-48` は
+**C. freundii (染色体性)** と、**同じ CMY ファミリーで逆**になる。
+`INTRINSIC_FAMILIES` は `{正規表現, 菌属}` の対で持ち、**菌種が分からないときは
+内在性と主張しない**。裏づけは全て実測 (ampC-Kaer→K. aerogenes /
+blaACT-GC1→E. hormaechei / blaMIR-15→E. roggenkampii / blaOXY→K. grimontii /
+blaPDC→P. aeruginosa)。**SHV と DHA / MOX は入れない** — SHV-1 は染色体性だが
+SHV-12 は獲得性 ESBL で、ファミリー名では分けられない (機能型の方で分かれる)。
+
+**罠 ③ — アレル未確定を「陰性」に化けさせない (#28)。**
+`TEM family class A beta-lactamase` (17 件) はアレルが決まっておらず ESBL か広域かが
+未確定。破線バッジ + 「アレル未確定」で明示する。**ただし NCBI が spectrum を
+書いていれば family レベルでも採用してよい** — NCBI は family の中で spectrum が
+割れるとき (TEM / SHV) は**そもそも descriptor を書かない**。無記載のときだけ
+`unknown` に落とす。
+
+**罠 ④ — 件数は「種類数」ではなく「検出コピー数」。**
+同じ遺伝子が別 contig に 2 コピー載ることがある (実測 17558 の blaCTX-M-14 が
+contig_2 と contig_4)。種類数で数えると「ESBL 1」と出て**見出しの総数 (4 件) と
+内訳の合計 (3) が食い違う**。実測 97 検体が該当。`count` (コピー数) と
+`genes` (重複排除した表示名) を別に持つ。
+
+**実データでの改善**: 旧実装は偽陽性回避のため SHV / TEM をファミリーごと
+除外しており、**実在の ESBL (blaSHV-12 ×3 / blaTEM-12 ×1) を取りこぼしていた**。
+アレル単位の NCBI キュレーションならこれが分かれる。退行は 0 件。
+**該当ファイル**: `frontend/src/lib/betaLactamase.ts` (新規・単一の真実源),
+`frontend/src/components/BetaLactamaseTag.tsx` (React ＋ HTML 文字列の二口),
+`frontend/src/lib/genomeMapUtils.ts` (`NormalizedGene.betaLactamase`。
+**産物名が読めるときはカルバペネマーゼ判定も分類器を正とする** — 遺伝子名の
+正規表現は blaGES-1 (ESBL) を誤判定し B3 メタロ酵素 blaPAM / blaPOM を取りこぼす),
+`frontend/src/lib/sampleBrief.ts` / `briefBadges.ts` (ESBL / ESAC / 獲得性 AmpC),
+`frontend/src/lib/htmlExport.ts`, `frontend/src/pages/SampleDetail.tsx`
+
+### 56.1 MEFinder の無言の偽陰性 112 件 — 再実行で踏んだ 4 つ
+**発端**: 利用者が「17558 は MGE がゼロだが正しいのか」と聞いた。**解析の失敗だった。**
+`mobileelement_result.json` が `status=FAIL` (`KeyError: 'contig_1'`) なのに、
+UI は **「MGE: 0」= 陰性として描いていた**。同じ分離株の別ライブラリは 106 elements。
+実測 (2026-09-10): NAS 全体で **PASS 999 / FAIL 112**。FAIL は 2026-06〜07 に集中し、
+**2026-07-18 (MEFinder の一時ディレクトリ隔離を入れた日) 以降は 0 件**。
+つまり修正済みのバグの**残骸が結果ファイルに残っていた**。
+→ `status !== 'PASS'` のとき「MGE: 検査不能」と描くようにした
+(`GenomeMap` の `mgeUnavailable`)。**この表示があれば 1 件目で気づけた。**
+
+**再実行で踏んだもの (どれも単独で全滅させる)**:
+1. **NAS の `input/contigs.fasta` はリンク切れ** (#17)。素直にターゲットを要求すると
+   snakemake が上流 (validate_fasta → アセンブリ) まで遡る。実体
+   (`assembly/long_read/contigs.fasta`) への**相対**シンボリックリンクに張り替える。
+   絶対パスを NAS に書かないこと (#35)。実測 111 件すべてがこの状態だった。
+2. **前回の `ERROR` マーカーが残る。** `parse_mobileelement.py` はこれを最優先で
+   見るので、**再実行が成功しても FAIL と報告される**。ルール側に
+   `rm -f {output.outdir}/ERROR {output.outdir}/SKIPPED` を入れた
+   (#28.2 と同型の「ガードが逆向きの偽陽性を作る」ケース)。
+3. **`--config samples={検体名}` を忘れない。** 無いと Snakefile 読み込み時に
+   `discover_samples()` が results ディレクトリ全体をサンプル入力として走査し、
+   **全件 fail する**。手動実行では付けていたのにツールで落としていた。
+4. **並列時は検体ごとに snakemake の作業ディレクトリを分ける** (#25)。
+   ロックは作業ディレクトリ単位なので、同じ cwd から `--jobs 3` すると後発が即死する。
+
+**結果**: 110 件を再実行して **NAS 全 1,111 検体が PASS / FAIL 0**。
+1 件 (`toho_micro_id/25648`) は `assembly` と `core_snp` しか無い未完了検体で
+再アセンブリが必要 (blocked として名前付きで報告)。
+**MEFinder を直したらインテグロンの `flanking_mge` も埋め直すこと** —
+レポート生成時に焼き込まれるので `backfill_integron.py --apply --force` を後追いする
+(インテグロン保有 297 検体中 228 検体・432 locus 中 337 locus が充填された)。
+**該当ファイル**: `workflow/scripts/rerun_failed_mefinder.py` (新規・dry-run 既定・冪等),
+`workflow/rules/stage1_mobileelement.smk`, `frontend/src/components/GenomeMap.tsx`
+
+### 56.2 表示層: 「重なる」と「ページごと横に伸びる」は別の原因
+どちらも実 DOM で測って初めて分かった。**対照 (壊れた状態) を再現してから直すこと。**
+
+- **`table-layout: fixed` では列が中身に合わせて広がらない。**
+  `white-space: nowrap` のセルが指定幅を超えると**隣の列に重なる**。実測: `%ID / %Cov`
+  は `100.00% / 100.00% aa` を描くのに **164px 必要なのに 110px** しかなく、
+  狭い窓で `100.00% / 100.00%contig_5` と重なっていた。列幅は**折り返さずに必要な幅を
+  実測して決める**。**列を足したら測り直すこと。**
+- **grid の子要素は既定が `min-width: auto`** = 中身の min-content より縮まない。
+  表に `min-width` を与えると**カードごと広がってページ全体が横スクロール**し、
+  ヘッダーが崩れて固定列が画面外へ出る (実測: 窓 700px でカードが 1015px)。
+  `.card:has(.table-wrapper) { min-width: 0; }` で、はみ出しを**その表の中**に閉じ込める。
+- **d3 の「選択ハイライト」effect は描画時の属性を上書きする。**
+  インテグロンを MGE トラック内の網掛けに変えたとき、effect が `opacity` と `stroke` を
+  無条件に書き戻して**網掛けも赤縁も消えていた**。濃さの定数を描画側と effect で共有し、
+  再計算が要る情報 (カルバペネマーゼか) は `data-carba` として DOM に持たせる
+  (effect が属性しか触らない = zoom を飛ばさない、という約束を守るため)。
+- **`table()` ヘルパは「`<` で始まるセルだけ」を生 HTML として扱う。**
+  `100.00% / 100.00% <span>aa</span>` のように**値から始まる**と丸ごとエスケープされ、
+  書き出したレポートにタグが文字列で出る (画面は React なので正常。長期間気づかれず)。
+  生 HTML を返すセルは `<span>` で包み、値は自分でエスケープする。
+- **JSX コメント `{/* … */}` の閉じ `}` を忘れても tsc のエラーは遠くの行に出る**
+  (`'}' expected` が数十行下の `</div>`)。コメントを疑うこと。
+- **テンプレート内の HTML コメントは書き出したレポートにそのまま載る。**
+  注記は TS コメント側に置く (文言の検査にも引っかかる)。
