@@ -3537,3 +3537,71 @@ UI は **「MGE: 0」= 陰性として描いていた**。同じ分離株の別�
   (`'}' expected` が数十行下の `</div>`)。コメントを疑うこと。
 - **テンプレート内の HTML コメントは書き出したレポートにそのまま載る。**
   注記は TS コメント側に置く (文言の検査にも引っかかる)。
+
+### 57. Proteus 属への対応 — MLST・菌種同定・cgSNP の 3 か所に穴があった
+**発端 (2026-09-14)**: 「MLST は Proteus spp. に対応しているか」。NAS 全 1,407 検体に
+Proteus / Providencia / Morganella は **0 件** = 一度も通したことが無い。
+ツール単体は対応していても、パイプライン側に 3 か所の穴があった。
+
+**① MLST — 実害は無かったが安全網が無かった**
+- mlst 2.33.1 (py39) は PubMLST の**属レベル** "Proteus spp." スキーム `proteus` を持つ
+  (atpD / dnaJ / mdh / pyrC / recA / rpoD の 6 座位、639 ST)。
+- `mlst.scheme_map` には Enterobacter しか無く自動検出任せだったので `'Proteus': proteus` を追加。
+  **実測では自動検出も `proteus` を選んでいた** (HI4320 = ST90、*P. vulgaris* FDAARGOS_1507 = ST14。
+  強制時と完全一致) ので既存の出力は変わらない。
+- `tools/prepare_representative_genomes.py` に実在しない `pmirabilis` が残っていた (#29.1 で
+  `backfill_missing_references.py` だけ直していた)。`proteus` に修正。
+
+**② 菌種同定 — 型株 DB に *P. vulgaris* が 1 株も無かった (実害あり)**
+- **DFAST 上流の `references.db` 自体に行が無い** (`is_valid` で落ちたのではない)。
+  NCBI が *P. vulgaris* の type assembly とするのは `GCA_901472505.1` (NCTC 13145, Complete, 1 contig)
+  だけで、NCBI の ANI 照合でも臨床株はこれに 99.7〜99.96% で一致する。
+  CheckM completeness は 73% と低く出るが、Proteus は他のゲノムも 81〜88% で marker set 側の問題。
+- **本番ルールで実測** (*P. vulgaris* FDAARGOS_1507): 旧 DB = `Unknown` / `below_threshold` /
+  最近縁 *P. terrae* ANI 90.17% → 新 DB = ***P. vulgaris* HIGH / ANI 99.96%**。
+  *P. mirabilis* HI4320 は両 DB で同一 (99.11%)。
+- 新 DB `DFAST_typestrain_20260914` = **旧 CSV 22,782 行 + 1 行**。スケッチは 22,781
+  (取り下げ済み 2 株は前回と同じ)。`convert` は**回していない** — 回すと上流の変化まで
+  取り込み、「1 株足しただけ」の検証にならない。CSV を作って `plan / download / sketch` だけ流した。
+- 切替前検証: `--check-references` で入れ替わり 0 件。検体 scan (74 検体, 菌種境界 0.95) は
+  **一致 68 / 最上位が変化 6 / 新たに同定 0 / 同定できなくなった 0**。変化 6 件は #49.3 と同じ
+  E. coli→Shigella / E. asburiae→dykesii で、比較列が各検体の保存済み結果なので出ているだけ
+  (`mash screen` は参照ごとに独立に採点するので、1 株足して最上位が変わりうるのはその株が勝つ
+  場合だけ。6 件の最上位に *P. vulgaris* は無い)。2026-09-14 に config を 20260914 へ切替。
+- **踏んだ罠**: Mac の `sqlite3 <存在しないパス>` は**空の DB ファイルを作る**。
+  `references.db` は `DFAST_typestrain_*/_work/` にあるのにディレクトリ直下を叩き、
+  NAS に 0 バイトのファイルを作った (削除済み)。存在確認してから開くこと。
+
+**③ cgSNP — 属内スキーム 1 つの罠 (#29 の一般則そのもの)**
+- Proteus は属内スキームが 1 つなので、属名マッチだけだと全種が `Pmirabilis` の参照に吸い寄せられる。
+  型株どうしの mash identity は *P. mirabilis* vs penneri 0.878 / cibi 0.865 / terrae 0.858 /
+  hauseri 0.856 / myxofaciens 0.848 で、分離の前例の Citrobacter (88〜91%) より遠い。
+  → `core_snp.species_scheme_map` に型株 DB にある Proteus 属 10 種を列挙して別 species_dir に分離
+  (`backfill_missing_references.py` の SPECIES_CONFIG と `audit_species_dir_mismatch.py` も同期)。
+  参照未整備の種は "no reference genome" で止まる。
+- `Pmirabilis/representative_genomes/STany/` に `GCF_000444425.1` (BB2000, 1 配列 3.85 Mb,
+  mlst ST95, NCBI ANI OK 98.9%) を配置。ST 固有の参照は無いので当面は全 ST が STany に落ちる
+  (#29.1: 複数 ST が同じ木に混ざる)。
+- `Pvulgaris/representative_genomes/STany/` に `GCF_020097355.1` (FDAARGOS_1507, 1 配列 3.96 Mb,
+  mlst ST14, NCBI ANI OK 99.96% to type) を配置 (2026-09-15)。実測 mash identity は
+  *P. vulgaris* 型株 0.9995 / Pmirabilis の BB2000 0.8779 = 分離が妥当。
+  **ツールの既定 (品質順の先頭) をそのまま使わないこと** — NCBI で *P. vulgaris* と登録された
+  complete genome の上位 10 件中 5 件は ANI 照合が Inconclusive (実体は *P. terrae* / *P. cibi*
+  または別種)。先頭の FDAARGOS_556 は本物だが汚染 8.66% だったため、`.backfill_work/{species_dir}/genomes/`
+  に採用株を先置きした (STany 分岐はキャッシュ済み fna があればそれを使う)。
+- **stringMLST の `datasets/Proteus_mirabilis/` は空** (`Neisseria_meningitidis` /
+  `Serratia_marcescens` も空)。`run_core_snp_map` は `stringMLST DB not found` を WARN して
+  **mlst モジュールの ST にフォールバックする**ので止まらない。
+
+**検証の型 (ワーカーで本番ルールをそのまま回す)**: スクラッチの results ツリーに
+`input/contigs.fasta` と実検体の `stage0/validation.json` を置き、DB パスだけを
+**2 つ目の `--configfile` (overlay)** で差し替えて
+`--allowed-rules mash_screen fastani_species_id merge_species_id` を回す。
+Snakemake の configfile は再帰マージされるので入れ子のキーだけ上書きできる。
+NAS の results には一切触らない。**長い処理は最初から `nohup setsid` で投げること** —
+foreground の ssh が切断されてもリモートのスクリプトは生き残ることがあり、
+同じスクラッチを `rm -rf` する再投入と衝突した (実測)。
+**該当ファイル**: `config/config.yaml` (`mlst.scheme_map`, `core_snp.species_scheme_map`,
+`species_id.*`), `config/config.multiserver.yaml` (`species_id.*`),
+`tools/prepare_representative_genomes.py`, `tools/backfill_missing_references.py`,
+`workflow/scripts/audit_species_dir_mismatch.py`
