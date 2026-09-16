@@ -3605,3 +3605,55 @@ foreground の ssh が切断されてもリモートのスクリプトは生き�
 `species_id.*`), `config/config.multiserver.yaml` (`species_id.*`),
 `tools/prepare_representative_genomes.py`, `tools/backfill_missing_references.py`,
 `workflow/scripts/audit_species_dir_mismatch.py`
+
+### 58. cgSNP の比較集団を実行前に選べるようにした (Tier 1 の窓 / DB の全株)
+**発端 (2026-09-16)**: proteus アカウントで後から cgSNP を実行したら
+「36 サンプルの上限」が掛かった、という指摘。これは `core_snp.max_strains: 36`
+(#23 / Tier 1 の窓) で、**分離日の降順に直近 36 株だけ**を比較する設計どおりの
+挙動。ただし利用者からは **cgSNP Phylo DB Browser の "Species × ST groups" に
+見えている株数がそのまま比較されると読める**ので、食い違いが分からない。
+窓を外して群の全株と比べる (= Tier 2) 選択肢を、**実行前に**出すようにした。
+
+**設計**: 判定は今までどおり `run_core_snp_phylo.collect_bams` だけが持ち、
+**`max_strains <= 0` を「上限なし」**として受ける。**`0` をそのまま
+`entries[:0]` に渡すと 1 株も選ばれない**ので、そこは必ず分岐すること
+(`workflow/tests/test_core_snp_population.py` で縛った)。
+- 経路は `--config core_snp_max_strains=N` (トップレベル)。`core_snp_phylo_jobs`
+  と同じ形 — snakemake の `--config` は入れ子キーを設定できない。
+- **ジョブの `config_overrides` は書き換えない。** あれはジョブに永続するので、
+  1 回の再実行のために足すと以降の実行にも付いて回る。`_build_remote_command`
+  に `extra_config`(この実行限り) を足し、`_run_core_snp_batch(max_strains=)`
+  から渡す。API は `?max_strains=` (省略=既定 / 0=上限なし / 2 以上=その株数)。
+- **どちらで走らせたかを結果 JSON に残す** (`population.scope` /
+  `max_strains` / `n_group_strains` / `truncated`)。**Tier 1 と Tier 2 の SNP 数を
+  同じ表に混ぜないこと** — コアゲノム長が違うので同じ 2 株でも 1〜2 SNP ずれる
+  (#23 / memory の replay 実験)。この層より前の結果は `population` を持たない
+  ので、**画面は「窓で実行した」と推測して書かない** (無ければ黙る)。
+- 窓の株数 (36) を**フロントに書かない**。`core_snp_db_info` が config の値を
+  返し、UI はそれを出す (config を変えたとき表示だけ古い数字が残るのを防ぐ)。
+
+**UI**: 検体詳細の Core-Genome SNP カード (未実行 / サンプル不足 / 保留 /
+キャンセル / 失敗 / **完了**) と Results 一覧の cgSNP ボタン横。
+**完了カードにも再実行の口を足した** — 上限で切られた結果を見て「全株で比べ
+直したい」と思うのはまさにその画面なので、Results まで戻らせない。
+切られた結果には「この範囲には見つからなかった、という意味に限られる」旨を
+明示する (#28 と同趣旨)。DB Browser にも「ここの株数は候補であって 1 回の
+解析が比べる株数ではない」と出す。
+
+**注意**: 全株を選ぶと **`min_core_fraction` (既定 0.6) に近づく**。
+コア率は株数が増えるほど下がる (実測 16 株 88% → 28 株 80.8%、全 DB 167 株で
+79.8%) ので、群が大きいと系統樹を出さず `failed` になりうる。**閾値は下げない**
+(沈黙した劣化を捕まえる最後の砦 — #26)。失敗理由には実測のコア率が入るので、
+それを見て判断する。所要は株数の約 1.76 乗 (36 株 30 分 / 87 株 1.1 h /
+167 株 3.6 h) なので、**既定を全株にしないこと。**
+**該当ファイル**: `workflow/scripts/run_core_snp_phylo.py` (`collect_bams`,
+`population`), `workflow/rules/stage2_core_snp.smk` (`core_snp_max_strains`),
+`workflow/tests/test_core_snp_population.py` (新規),
+`api/services/snakemake_runner.py` (`_build_remote_command(extra_config=)`,
+`_run_core_snp_batch(max_strains=)`, `run_core_snp_for_job`, `run_core_snp_adhoc`),
+`api/routers/jobs.py` (`_validate_max_strains`, 2 つの cgSNP 実行 API),
+`api/routers/results.py` (`core_snp_db_info` の `max_strains`),
+`api/tests/test_core_snp_stage_plan.py`, `frontend/src/lib/api.ts`
+(`CORE_SNP_SCOPE_ALL`), `frontend/src/components/CoreSnpSection.tsx`
+(`PopulationScopeChoice`), `frontend/src/pages/Results.tsx`,
+`frontend/src/pages/CoreSnpDbBrowser.tsx`
