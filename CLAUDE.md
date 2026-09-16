@@ -3657,3 +3657,313 @@ foreground の ssh が切断されてもリモートのスクリプトは生き�
 (`CORE_SNP_SCOPE_ALL`), `frontend/src/components/CoreSnpSection.tsx`
 (`PopulationScopeChoice`), `frontend/src/pages/Results.tsx`,
 `frontend/src/pages/CoreSnpDbBrowser.tsx`
+
+### 59. 「アレル未確定」の 3 分の 2 は環状 contig の切れ目で分断されていただけ
+**発端 (2026-09-16)**: proteus で AMR Gene Profile の blaCTX-M がアレル未確定
+(`blaCTX-M` + 破線バッジ) の検体が散見される、アミノ酸レベルで同一なら確定して
+ほしい、という指摘。**調べたら 3 群に割れた。**
+
+| 群 | 検体 | Method | 実体 | 確定できるか |
+|---|---:|---|---|---|
+| **環状 contig の接合部で分断** | **10** | `PARTIAL_CONTIG_ENDX` (被覆 51〜90% / 同一性 100%) | 繋ぎ直すと**既知アリルとアミノ酸完全一致** (9=CTX-M-2 / 1=CTX-M-253) | **できる** |
+| 全長だが 1 aa 変異 | 5 | `BLASTX` (被覆 100% / 同一性 **99.66%**) | 既知アリルと非同一 = 新規変異体 | **できない** |
+| 断片化 / 部分 + 変異 | 2 | `PARTIAL_CONTIG_ENDX` | 別 contig 2 本 (22319) / 被覆 71% + 99.52% (15649) | **できない** |
+
+**1 aa 変異体が本当に新規であることの裏づけ**: ResFinder DB の CTX-M **193 アリル
+(ユニーク蛋白 192)** と総当たりしても完全一致 0。最近縁は 1 aa 違い
+(11504/11505/11506 = CTX-M-2、15609 = CTX-M-147、22362 = CTX-M-35)。
+ResFinder 自身も 99.89% (873 nt 中 1 nt 違い) と報告している。
+**AMRFinderPlus が保守的すぎるのではなく、本当に一致していない。**
+なお **ResFinder DB は CTX-M-220 までで CTX-M-253 を持たない**ので、
+照合は「AMRFinderPlus が ALLELEX と断じたその検体群の蛋白」も併用すること。
+
+#### 直した本体 — 回転コピーを作って AMRFinderPlus にもう一度かける
+アセンブラは環状分子を任意の 1 点で切って線形 contig にする。その切れ目が
+遺伝子内に落ちると AMRFinderPlus は断片しか見られず、アリルを確定できず
+ファミリー名を返す。**SPAdes は環状 contig の両端に k-mer ぶんの同一配列を
+残す** (実測 k=127。44〜268 contig の検体で末端重複を持つのは 1〜2 本だけ =
+誤検出の余地は小さい)。これを落として環に戻し、回転してから 2 パス目を回す。
+- **配列も座標も書き換えない** (#19 / #21 / #22)。回転するのは
+  「AMRFinderPlus にもう一度見せるための一時コピー」だけ。
+- **アリル名を自分で決めない。** 自前でアリル表を持つと AMRFinder の DB 版と
+  ずれる。位置は自前・命名は権威ツール (#42 と同じ役割分担)。
+- **元が分断されていたヒットしか採らない。** 回転後のヒットが元の切れ目を
+  またいでいることを必ず確かめる (`spans_junction`)。またいでいなければ
+  ただの重複検出。
+- **回転量は既存ヒットの外側に置く** (`choose_offset`)。真ん中固定にすると
+  環が小さく遺伝子が長い検体で回転点が別の遺伝子を割る。
+- 環状性の根拠は 3 つ (末端重複 / `molecule_classification.json` /
+  ヘッダの `_circular`)。**どれも取れなければ手を出さない** — 非環状 contig を
+  勝手に繋ぐと実在しないキメラ遺伝子を報告することになる。
+  `molecule_classification` は amrfinder と並行に走るので**実行時には無いことが
+  多い**。SPAdes は末端重複、Flye はヘッダで拾える。
+- **1 つの遺伝子が 2 断片として報告される** (実測 11552 / 11560 = 環の切れ目が
+  遺伝子の真ん中)。両方の行に同じ復元を貼り、**断片番号を出して 2 遺伝子と
+  読ませない**。
+- **できなかったことを黙って落とさない** (#28)。`status` は
+  `not_applicable` (候補 0 件) / `ok` / `unavailable` (2 パス目が落ちた) /
+  `not_configured` の 4 値。復元できなかった候補は理由付きで `unresolved` に残す。
+  旧検体は `split_gene_resolution.json` を持たないので `not_run`。
+  **「分断は無かった」と「この層が走っていない」を同じ表示にしないこと。**
+
+#### 表示 — 確定したアリルを出すが、元の報告名を必ず併記する
+`blaCTX-M-2` + 緑の「接合部復元」バッジ + 元の `blaCTX-M` + 「1/2 断片」。
+数字だけ見せると AMRFinderPlus がそのまま返した値と区別が付かない
+(#32 の「重複除去で確定した ST」と同じ規約)。%ID / %Cov と行の色 (Method) も
+**全長で測り直した値**に差し替える — 断片の被覆 61.86% をそのまま出すと
+確定したアリルと食い違って読めない。
+
+**同席で塞いだ穴: `closest_name` が UI のどこにも出ていなかった。**
+AMRFinderPlus の `Closest reference name` 列はパーサが 2026 年から
+`closest_name` として保存しているのに、frontend は 1 箇所も読んでいなかった。
+そのため 1 aa 変異体の 5 検体は「blaCTX-M · アレル未確定」としか見えず、
+**「CTX-M-2 に 99.66% で最も近い = 新規変異体の可能性」という一番重要な所見が
+画面に無かった**。アレル未確定の行に「最も近い既知アリル: CTX-M-2 (99.66%)」を
+出すようにした。全長が取れているか (被覆 ≥99.5%) で
+「新規変異体の可能性」と「切れているだけ」を文言で書き分ける。
+
+#### 既存検体 = `backfill_split_gene_resolution.py` (dry-run 既定)
+**AMRFinderPlus 本体は再実行しない。**走らせるのは回転コピーに対する 2 パス目
+だけで、既存の `amrfinder_output.tsv` は読むだけ。アセンブリも触らない。
+書き換えるのは `split_gene_resolution.json` (新規) /
+`amrfinder_result.json` (行に `resolved_*` を貼る) /
+レポートの **`amrfinder` セクションだけ** (`backfill_sample_reports.py --force`
+は使わない — #28)。NAS の `input/contigs.fasta` はリンク切れなので候補順に解決
+(#17)。書き込みは一時ファイル + `os.replace`、**ディレクトリの rename はしない**
+(#46.2)。`--shard` と `--skip-existing` は併用不可 (#51)。
+
+**DAG を変えないこと。** `split_gene_resolution.json` は `amrfinder` ルールの
+**2 つ目の出力**にして、`parse_amrfinder` からは **params 渡し**で読む。
+input にすると既存検体で DAG が遡り、リンク切れの contigs.fasta を作り直そうと
+して**再アセンブリまで走る** (#17 / #47)。
+
+**規模 (実測 2026-09-16, NAS 全 1,590 検体)**: `PARTIAL_CONTIG_END*` は 812 行
+(kaoki_stec 367 / toho_micro_id_temp 260 / toho_omori 160 / proteus 21 …)。
+blaCTX-M 以外にも `gtgA` 122 / `stx2_operon` 97 / `tccP` 95 / `blaR1` 42 /
+`sul2` 17 などが同じ状態で、**この層は β-ラクタマーゼ専用ではない**。
+
+**該当ファイル**: `workflow/scripts/resolve_split_genes.py` (新規・判定の単一の
+真実源), `workflow/scripts/backfill_split_gene_resolution.py` (新規),
+`workflow/tests/test_split_gene_resolution.py` (新規),
+`workflow/rules/stage1_amrfinder.smk`, `workflow/scripts/parse_amrfinder.py`
+(`read_split_resolution` / `build_fragment_index` / `apply_resolution`),
+`workflow/scripts/per_sample_report.py` (`split_resolution` / `num_split_resolved`),
+`config/config.yaml` の `amrfinder.resolve_circular_splits`,
+`frontend/src/lib/amrResolution.ts` (新規・`alleleFromProductName` はここへ移設 —
+betaLactamase.ts と循環 import になるため), `frontend/src/components/AmrGeneCell.tsx`
+(新規), `frontend/src/lib/betaLactamase.ts` / `sampleBrief.ts` / `genomeMapUtils.ts` /
+`plasmidMap.ts` / `htmlExport.ts` / `pages/SampleDetail.tsx`
+
+### 60. 1 検体に複数ランの FASTQ があると、辞書順の最初だけが黙って使われていた
+**発端 (2026-09-16)**: proteus (Illumina 2×301 MiSeq) の被覆が低く、
+クオリティトリミングが厳しすぎるのではないか、という疑い。**トリミングは
+無実で、リードの 3 分の 2 が解析に入っていなかった。**
+
+#### トリミングは原因ではない (先に潰した仮説)
+fastp はリードの **95%**・塩基の **88%** を残していた (中央値)。内訳は
+low_quality 4.0% / too_short 1.6% / 先頭カット 10 bp per pair / R2 末尾 ~19 bp。
+**トリミングを完全に外しても最低被覆の検体は 30.7x → 35.6x にしかならない。**
+唯一の無駄は `-f 5 -F 5` (先頭 5 塩基の強制カット) で、実測 20 検体の
+cycle 1-5 の平均 Q は **33.8** (6-10 塩基目が 37.6)、Q30 を下回る検体は **0/20**。
+外してよいが効果は塩基の 1.9%。**この程度の話に留まる。**
+
+#### 真因 — `_detect_short_reads` が `r1_files[0]` を黙って採る
+```
+13325/  13325_S0_L001_R1_001.fastq.gz    40 MB  ← これだけ使われていた
+        13325_S14_L001_R1_001.fastq.gz   88 MB  ← 未使用
+11529/  3 ラン分あり、使われていたのは全体の 18%
+```
+| | 検体数 | 被覆 | contigs | N50 |
+|---|---:|---:|---:|---:|
+| FASTQ **1 ペアのみ** | 134 | **82.1x** | **90** | **109.2 kb** |
+| FASTQ **2 ペア以上** | **49** | **32.3x** | **379** | **17.9 kb** |
+
+- 使われていたのは中央値 **32.6%**。**13.7 GB (圧縮) が一度も解析に入っていない。**
+- 追加ペアは **同一検体**。k-mer 含有率で確認した (同一ペア 0.866 / 0.871 /
+  0.878 / 0.883 に対し**別検体は 0.656〜0.733**。対照を取らないと
+  「同じ菌種だから似ている」だけの可能性を排除できない)。
+- **`all_files` には全部載っていた**ので、記録はあるのに使っていなかった。
+  これが一番たちが悪い — 入力の取りこぼしは出力を見ても分からない (#28 の入力版)。
+- 他アカウント: toho_omori 20971 の 1 件のみ、kaoki_stec は 0 件。
+- ディレクトリを直接走査すると **53 検体** (results がまだ無い 4 検体を含む)。
+  取り込まれる追加バイトは **14.7 GB**、1 検体あたり中央値 **3.07 倍**・最大 5.71 倍。
+
+#### なぜ被覆が分断に直結するか (SPAdes の実測)
+SPAdes は k=[21,33,55,77,99,127] で走り **最終グラフは K127**。
+各 K での平均被覆 (spades.log から実測):
+
+| 検体 | K21 | K55 | K99 | **K127** | read 被覆 |
+|---|---:|---:|---:|---:|---:|
+| 22329 | 19.9 | 11.7 | 5.8 | **3.8** | 24.3x |
+| 13325 | 18.3 | 12.6 | 7.6 | **5.4** | 23.8x |
+| 11552 | 137.1 | 103.5 | 69.4 | **52.2** | 156.8x |
+
+- `--isolate` は**リード誤り補正をしない** (`Mode: ONLY assembling (without
+  read error correction)`)。残存誤り率 0.3〜0.6% で 127-mer の 4 割が壊れる
+  (k-mer 被覆 / read 被覆 = **0.294**、read 長の幾何比だけなら 0.48)。
+- 低被覆群は **33/33 検体**で `Failed to determine erroneous kmer threshold`
+  (高被覆群は 2/73)。SPAdes の誤り k-mer モデルが破綻している合図。
+- 相関: 被覆 vs contigs 数 **r = −0.82** / rawQ30 vs contigs 数 −0.55 =
+  **被覆が支配的**。
+- CheckM2 completeness は 183 検体すべて 100.0 だが、アセンブリ長は
+  低被覆群 3.85 Mb vs 高被覆群 4.10 Mb = **250 kb の差**。
+- `min_contig_cov: 2.0` は **k-mer 被覆の絶対値**なので低被覆検体で効きすぎる。
+  落とされた塩基は低被覆群 **121 kb** vs 高被覆群 **1.7 kb**。K127 被覆 3.8 の
+  検体では閾値 2.0 が「ゲノム水準の 53%」に相当する。
+- **被覆が 100x まで戻れば K127 被覆は 30 前後**になるので、`--isolate` も
+  `min_contig_cov` もそのままでよい。**先に入力を直すこと。**
+
+#### 直したこと
+- `classify_input._detect_short_reads` が**全ペアを返す**
+  (`short_read_pairs`)。`short_reads` は先頭ペアのまま残す (seqsero2 /
+  cefiderocolFinder 等の既存読み手をそのまま動かすため)。
+- **R1 と R2 を名前で対応付ける。** 旧実装は `r1_files[0]` と `r2_files[0]` を
+  **独立に**選んでいたので、並び順が違えば別ランの組になる。実データでは
+  接頭辞が同じなので露見していなかっただけ。
+- **相方の無いファイルを `unpaired_reads` に記録する** (#28)。使わないが捨てない。
+  片側だけをペアエンドとして流すとインサートサイズが壊れる。
+- `_detect_long_reads` の除外を「先頭ペア」から**全ペア**に変更。2 ラン目の
+  R1/R2 を長鎖リードとして拾わないため。
+- `merge_read_pairs.py` (新規) が結合を担当。**1 ペアならコピーしない**
+  (実測 134/184 検体。従来と完全に同一の入力になる)。2 組以上なら `cat` で
+  連結する — **gzip は連結しても正当な gzip** なので再圧縮しない
+  (実測 13325: 128 MB の連結が 2 秒、R1/R2 とも 582,142 reads で本数一致)。
+  圧縮と非圧縮が混在したら**結合せず先頭ペアのみ**にして理由を残す。
+- アセンブリ (`spades_assembly`) と **cgSNP (`core_snp_map`) の両方**で使う。
+  同じ検体なのにアセンブリと cgSNP で入力が違うと被覆が食い違う。
+- 結合した一時ファイルは **EXIT trap + アーカイブ前 sweep の二重**で消す
+  (`SHORT_READ_INTERMEDIATE_NAMES` と `*/core_snp/reads/merged_R*`)。
+  SIGKILL で落ちると数百 MB が NAS へアーカイブされる
+  (project_assembly_intermediate_fastq_leak の再発防止)。
+  **`core_snp/mapping/` は触らないこと。**
+- レポートの `read_qc.input_pairs` に「何ペア見つけて何ペア使ったか」を出す。
+  **`not_recorded` (この層より前の解析) と「1 ペアだった」を書き分ける** (#28) —
+  旧レポートは前者で、結合したかどうかを後から判定できない。
+
+#### 再解析の注意
+- **`--forceall` (GUI の Force Re-run) が必要。** `input_class.json` は
+  checkpoint の出力で、ディレクトリの mtime が変わっていないため通常の
+  再実行では**再生成されず、古い 1 ペアのままになる**。
+- **New Job は入力ディレクトリ配下を全走査する。** 検体を選ぶ UI が無かったため、
+  Force Re-run と併用すると**無関係な検体まで上書き再解析される**。
+  API 側は `config_overrides["samples"]` で絞れる (`_run_account_job` が
+  discover 結果をフィルタし、`discover_samples` も同じキーを見る) ので、
+  New Job に「対象サンプル (任意)」欄を足してそこへ流す。空欄なら従来どおり全件。
+- **`discover_samples` の `samples` 上書き経路は入力ディレクトリを優先させること。**
+  以前は `results/{s}/` を先に見ており、`--forceall` と併用すると
+  classify_input が強制再実行されて**リードの無い results/{s}/ を走査し
+  `input_class.json` を mode=unknown に上書き破壊する** (#28.3 と同じ事故)。
+  再ディスパッチでスクラッチに中途半端な results/{s}/ が残っていると踏む。
+  results へのフォールバックは on-demand cgSNP / bakta 経路のために残すが、
+  あちらは input_dir 自体が results を指すのでどちらを選んでも同じパスになる。
+- 多検体をまとめて投入するときは **Defer cgSNP phylo** を併用する
+  (1 検体ごとに群全体の系統樹を作り直さないため。#58)。
+- 再解析後は**プラスミド関連性を手動で回し直す** (#42.1 — 自動フォローアップは
+  そのジョブの検体だけでグループ全体の成果物を上書きする)。
+- #59 の backfill は**再解析しない検体にだけ**当てればよい (再解析した検体は
+  新パイプラインが `split_gene_resolution.json` を自分で作る)。
+
+**該当ファイル**: `workflow/scripts/classify_input.py`
+(`_pair_key` / `_detect_short_reads` / `_detect_long_reads` / `_make_result`),
+`workflow/scripts/merge_read_pairs.py` (新規),
+`workflow/tests/test_read_pair_merge.py` (新規),
+`workflow/rules/stage1_spades_assembly.smk` (`_get_short_reads` がリストを返す),
+`workflow/rules/stage2_core_snp.smk`, `workflow/rules/stage4_aggregate.smk`,
+`workflow/scripts/per_sample_report.py` (`read_qc.input_pairs`),
+`api/services/snakemake_runner.py` (`SHORT_READ_INTERMEDIATE_NAMES`,
+`_sweep_intermediates_cmd`), `workflow/Snakefile` (`discover_samples` の優先順),
+`frontend/src/pages/NewJob.tsx` (対象サンプル欄 → `config_overrides.samples`),
+`frontend/src/pages/SampleDetail.tsx` (`readQcPairsLabel`),
+`frontend/src/lib/htmlExport.ts`
+
+### 60.1 長鎖リードも「キーワードで選別」して片方を黙って捨てていた
+**症状 (実測 2026-09-16, toho_micro_id_bsi / 17559_BSI)**: ONT の fastq.gz を
+2 本投入したのに 1 本しか解析に入っていなかった。`input_class.json` の
+`all_files` には 2 本とも載っているのに `long_reads` は 1 本だけ。
+`mode` は `long_read` で正しく、**モードの誤判定ではない**。
+
+| ファイル | 実体 | 使用 |
+|---|---|---|
+| `45e82908-…_SQK-RBK114-24_barcode12.fastq.gz` | 6/16 分への重複検知シンボリックリンク。80,888 reads / **139.8 Mbp** | ✅ |
+| `17559_BSI.fastq.gz` (dorado 生成) | 99,997 reads / **209.3 Mbp** | ❌ |
+
+**原因**: long/short の判別は**完全にファイル名ベース**で中身は一切見ない。
+short は `_R1[_.]`/`_R2[_.]` または `_1.fastq.gz`/`_2.fastq.gz` の**ペアが
+揃ったとき**だけ成立し、long は「ペアに取られなかった残り」。
+ところが `_LONG_READ_KEYWORDS` (`barcode` / `rbk` / `fastq_runid_` /
+`nanopore` / `ont_`) が **long か否かの判定ではなく候補の選別**に使われており、
+**一致が 1 本でもあると非一致のファイルを全部捨てていた**。
+dorado の出力名 `{sample}.fastq.gz` はどのキーワードにも当たらない。
+
+**単独で置かれていれば正しく採用される**ので発見が遅れた (同じファイルが
+kojima アカウントでは単独配置で正常に使われていた)。**発火するのは
+「dorado 出力をダウンロードして MinKNOW 名のファイルと一緒に再投入した」
+ときだけ**で、通常の dorado フロー (1 ディレクトリ 1 ファイル) では起きない。
+
+**同一分離株であることの確認 (対照つき)**: read ID の重複 **0 件** (独立データ
+= 加算できる)、31-mer 含有率は 17559_BSI のアセンブリに対し 0.685 / 0.577、
+**別検体 (11043_BSI) 対照は 0.018**。#30 の教訓どおり対照を取らないと
+「同じ菌種だから似ている」だけの可能性を排除できない。
+
+**修正 (2 つとも入れる。片方だけでは再発する)**:
+1. **`_detect_long_reads` はキーワードで選別しない。** ペアに取られなかった
+   read ファイルのうち **Illumina 命名 (`_R1_` / `_S12_` / `_L001_` /
+   `_1.fastq.gz`) 以外は全部**採る。キーワードは「short ペアが同居していて
+   判断が付かないとき」に ONT の存在を示す手掛かりとしてのみ使う (hybrid)。
+   採らなかった read ファイルは `unpaired_reads` に記録する (#28)。
+2. **dorado の出力名を `{sample}_{barcode}.fastq.gz` にする**
+   (`dorado_runner._fastq_basename`)。`barcode01` は `barcode` に一致するので
+   単独でも混在でも long read として扱われ、由来も名前に残る。
+   - **`ont_` は末尾のアンダースコアまで含めて必要。** `{sample}_ont.fastq.gz`
+     では一致しない。テスト (`api/tests/test_dorado_fastq_name.py`) で
+     「生成名が実際に `_LONG_READ_KEYWORDS` に当たること」を縛ってある。
+   - **旧名との共存を潰すこと。** `dorado_samples/{job}/{sample}/` は
+     そのまま下流の入力ディレクトリなので、旧版が書いた `{sample}.fastq.gz`
+     が残ると 1 の修正と相まって**同じリードを二重に流し込む**。計測
+     スクリプトが目的の 1 本以外の `*.fastq.gz` を消してから生成する。
+
+**回帰確認**: NAS 全アカウントの `all_files` を再現した一時ディレクトリに
+新旧両方を当て、**1,575 検体中の差分は 17559_BSI の 1 件だけ**
+(長鎖リードが 1 本 → 2 本)。`long_reads` に Illumina 命名のファイルが
+入っている検体は 0 件なので、新しい除外規則による取りこぼしも無い。
+
+**再解析の効果 (実測)**: `total_bases` 86.7 → **235.3 Mbp** (15x → 41x、
+目標 55x には届かないので間引きは発火せず全量使用)。
+
+| | 修正前 | 修正後 |
+|---|---:|---:|
+| contigs | 38 | **15** |
+| N50 | 331,325 | **5,839,913** (染色体が 1 contig に閉環) |
+| 最大 contig | 2,292,540 | 5,839,913 |
+| 総長 | 6,090,418 | 6,199,512 |
+| CheckM2 完全性 / 汚染 | 99.98 / 0.65 | **100.0 / 0.29** |
+
+**妥当性は同一分離株の別ライブラリ (17559) で裏づけた**: 染色体長が
+5,839,913 vs 5,839,915 bp (**2 bp 差**・どちらも閉環)、cgSNP **1 SNP**
+(コア率 80.2%)、MLST koxytoca ST216 一致、AMR 9 遺伝子が完全一致
+(blaIMP-1 含む)、インテグロンのカセットシグネチャ
+`intI1|blaIMP-1|aac(6')-IIc|qacL|3'-CS` と attC 3 個が一致、
+プラスミド 7 本 (AA035 / AA002 / AB049 / AA101 / AA130 / AD996 / AA119) が
+サイズまで 1:1 対応。
+
+**被覆が上がると小型 contig が増える。増分は必ず素性を確かめること。**
+17559_BSI 側だけに 7 本 (8,089 bp の線状 1 本 + 1,019〜2,735 bp の 6 本) が
+増えた。読み方は 3 通りに分かれた:
+- 8,089 bp は**ペアの生リードにも大量にある** (200 シードで 619,372 hits) が
+  ペアのアセンブリには 0% = #30 と同じ「在るのに組めていない」型。
+- 残り 6 本は 17559_BSI の**両ライブラリにあってペアのリードにはほぼ 0 hits**。
+  ユニーク 31-mer が長さの 2〜4 割しかない**高反復配列**で、AMR は載っていない
+  (AMR セットはペアと完全一致)。#49 の「サテライト状の反復」と同型。
+- **バーコード漏れではない**: 同一アカウント 89 検体のアセンブリと突き合わせて
+  50% 超一致は **0 件**。
+
+**運用**: 再解析なので `results/{sample}/plasmid_clusters/` は古いまま
+(この検体は 9/4 生成)。**プラスミド関連性はグループ全体で回し直すこと** (#42.1)。
+plasmid DB 側は `num_registered=7 / num_refreshed=6` で #42.5 の更新経路が
+効いており、新しいアセンブリの配列に差し替わっている。
+**該当ファイル**: `workflow/scripts/classify_input.py`
+(`_LONG_READ_KEYWORDS` の位置づけ, `_RE_ILLUMINA_HINT`, `_detect_long_reads` の
+2 値返し), `workflow/tests/test_read_pair_merge.py`,
+`api/services/dorado_runner.py` (`_fastq_basename`, `_SAFE_NAME_RE`,
+`_measure_barcode_coverage_inner` の旧 fastq 掃除),
+`api/tests/test_dorado_fastq_name.py` (新規)
