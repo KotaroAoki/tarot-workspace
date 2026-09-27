@@ -3967,3 +3967,30 @@ plasmid DB 側は `num_registered=7 / num_refreshed=6` で #42.5 の更新経路
 `api/services/dorado_runner.py` (`_fastq_basename`, `_SAFE_NAME_RE`,
 `_measure_barcode_coverage_inner` の旧 fastq 掃除),
 `api/tests/test_dorado_fastq_name.py` (新規)
+
+### 61. 本番構成 (api/serve.py) と Windows オーケストレーターで踏むもの
+**背景 (2026-09-28)**: オーケストレーターを Mac mini から Windows Server 2025
+(172.20.17.124, 院内 LAN) へ移し、インターネットに公開する。計画と進捗は
+`PLAN_windows_server_migration.md`。Phase 1 (本番化) で入れたもの:
+- **起動は `python -X utf8 -m api.serve --env-file <file>`** (Mac/Windows 共通)。
+  `--reload` なし・`127.0.0.1` 待ち受け・ワーカー 1・graceful shutdown 30 秒上限。
+  状態 (セッション・実行中ジョブ) はプロセス内メモリなので**ワーカー数を増やさないこと**。
+- `TAROT_FRONTEND_DIST` を設定したときだけ `frontend/dist` を同一オリジンで配信する
+  (`api/frontend_static.py`)。未設定なら従来の開発構成 (Vite :3000 → :8000) のまま。
+  API の情報は `/api/info` に移した (配信時は `/` を画面に譲る)。
+**Windows で壊れる点 (すべて対処済み。同じ種類のコードを書くときに守ること)**:
+- **リモート (Linux) のパスを `Path()` で扱わない。** Windows では `WindowsPath` になり
+  `str(Path(remote).parent)` が `\mnt\nas\...` を返す (`sftp_upload` の mkdir が実際に
+  そうなっていた)。リモートは `PurePosixPath`、tar の arcname は `as_posix()`。
+- **ローカルのテキスト I/O は UTF-8 を明示する。** Windows の既定は cp932 で、
+  config.yaml の日本語で即死する。`serve.py` は UTF-8 モードでなければ起動を拒否する。
+- **`mimetypes` は Windows ではレジストリを読む。** `.js` が `text/plain` だと
+  ブラウザが module script を拒否して画面が真っ白になるので、配信側で固定してある。
+- **改行コードは `.gitattributes` で LF 固定。** `workflow/` と `config/` は
+  オーケストレーターの作業ツリーから tar でワーカーへ送られる (`_sync_pipeline_files`)
+  ので、Windows の git が CRLF に変換すると全ジョブが落ちる。
+- `resource` は Windows に無い (fd 上限の引き上げは POSIX のみ)。
+**本物の DB と鍵を指した本番構成を、開発用 API と同時に動かさないこと** —
+ディスパッチャが 2 つになり、同じワーカーへ二重投入する。
+**該当ファイル**: `api/serve.py`, `api/frontend_static.py`, `api/main.py`,
+`deploy/tarot.env.example`, `.gitattributes`, `api/tests/test_production_serving.py`
