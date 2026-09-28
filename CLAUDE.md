@@ -3994,3 +3994,57 @@ plasmid DB 側は `num_registered=7 / num_refreshed=6` で #42.5 の更新経路
 ディスパッチャが 2 つになり、同じワーカーへ二重投入する。
 **該当ファイル**: `api/serve.py`, `api/frontend_static.py`, `api/main.py`,
 `deploy/tarot.env.example`, `.gitattributes`, `api/tests/test_production_serving.py`
+
+### 62. インターネット公開の守り (TAROT_INTERNET_FACING) と、公開前監査で見つかった穴
+**背景 (2026-09-28)**: Windows Server への移行に合わせて外部の組織からログインできるようにする
+(#61)。共通の ID 基盤が無いので、認証は**アプリ内の 2 段階認証 (TOTP) + 申請 → 管理者承認**。
+**`TAROT_INTERNET_FACING=true` は個別に緩められない一括スイッチ** — 公開に必要な守りを
+1 つずつ env で切り替えられると、どれか 1 つの設定漏れで穴が開く。開発 (Mac・LAN) では false。
+
+**公開前監査で見つかった穴 (すべて塞いだ。同種のコードを書くときに守ること)**:
+- **`get_session()` を認証に使わない。** ワーカー接続プール (キー = worker_id) も横断検索するので、
+  `Authorization: Bearer honban` でログインなしに API が使えた。HTTP の認証は
+  `get_user_session()` だけ。
+- **クライアントの文字列をシェルに入れない。** アップロードのファイル名が
+  `mkdir -p "…"` / `ln -sfn "…"` に埋め込まれ、`"$(…)"` でワーカー上のコマンドを実行できた。
+  入口で文字種を縛り (`safe_relative_path` / `api/validators.py`)、シェル側は `shlex.quote`。
+- **`results_dir` などの相対パスを検証せずに連結しない。** `_results_path()` が
+  `{グループのルート}/{results_dir}` を作るだけで、`../../<他グループ>/results` で他グループを
+  読めた。`InputValidationMiddleware` が `/api/` のパス要素と既知のクエリ引数をルーティング前に
+  縛る (実データ 1,600 検体名がすべて `[A-Za-z0-9_][A-Za-z0-9._+-]*` に収まることを確認済み)。
+  JSON ボディのサンプル名リストは見えないのでエンドポイントで `validate_names`。
+- **ジョブは ID だけで引かない。** `owned_job()` で所有グループを確かめ、他グループのジョブは
+  **404** (403 だと存在を教える)。一覧 (`GET /api/jobs`・Dorado) も認証必須・グループで絞る。
+- **全体に効く操作は管理者 + LAN。** `/api/config` は**未認証で書き換え可能**だった。
+  config.yaml の値はワーカーのシェルに展開されるので「書ける = ワーカーでコマンドを実行できる」。
+  `config_overrides` も `--config key=value` でそのままシェルへ渡っていたので、利用者が指定
+  できるキーは `samples` だけ (`USER_CONFIG_OVERRIDE_KEYS`)。
+- **`role` 列は以前どこでも使われていなかった。** 今は admin = 承認・config・DB パス切替の権限。
+  LAN 外からのログインでは admin を持ち込ませない (`_effective_role`)。
+
+**信頼ネットワークの判定の罠**: 送信元はリバースプロキシの `X-Forwarded-For` から uvicorn が
+復元した IP。**プロキシが実 IP を渡さないと全員が 127.0.0.1 = LAN に見える**ので、公開モードでは
+ループバックを信頼しない (`TAROT_TRUST_LOOPBACK` で明示したときだけ)。Phase 7 では外部回線から
+管理機能が 403 になることを必ず確かめること (ルータの NAT がヘアピン時に送信元を書き換えると
+同じ問題が起きる)。
+
+**2 段階認証**: `api/services/totp.py` (標準ライブラリのみ、SHA-1・6 桁・30 秒 = 認証アプリの
+互換性のため変えない)。同じ時間ステップのコードの再利用は `advance_totp_step` (条件付き UPDATE)
+で拒否、`mfa_token` は 5 分・5 回・発行元 IP に紐付け。**登録の保存はセッション確立の後** —
+先に保存するとワーカーに繋がらなかったとき「登録済みなのにリカバリーコードを見ていない」が残る。
+
+**セッションの期限切れで SessionInfo を消さないこと** — 実行中ジョブが token を参照する (#36.2)。
+HTTP からの利用だけを止める。
+
+**既存 DB の移行**: accounts に status (DEFAULT 'active') ほかを `_migrate()` で追加。既存の
+10 アカウントは全員「有効・2 段階認証未登録」になり、公開モードで次にログインしたときに登録する。
+**注意**: `import api.main` だけで既定の `api/data/tarot.db` が開かれて移行が走る。検証では
+`TAROT_DB_PATH` を一時ファイルに向けること。
+
+**該当ファイル**: `api/security.py`, `api/validators.py`, `api/services/totp.py`,
+`api/routers/auth.py` (`require_session` / `require_admin` / `/mfa` / signup),
+`api/routers/account_admin.py`, `api/services/account_store.py`, `api/routers/upload.py`
+(`safe_relative_path`), `api/routers/jobs.py` / `dorado.py` (`owned_job`), `api/routers/config.py`,
+`api/tests/test_internet_facing_security.py`, `api/tests/test_tenant_isolation_inputs.py`,
+`frontend/src/pages/Login.tsx`, `frontend/src/components/TotpQr.tsx`,
+`frontend/src/components/AccountAdminPanel.tsx`, `deploy/tarot.env.example`
