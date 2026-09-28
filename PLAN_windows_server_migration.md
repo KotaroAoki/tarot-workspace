@@ -1,6 +1,6 @@
 # オーケストレーターの Windows Server 2025 移行 + インターネット公開
 
-作成: 2026-09-28 / 状態: Phase 1・2 完了 (Mac 上で検証済み)
+作成: 2026-09-28 / 状態: Phase 1・2 完了、Phase 3 の手順書・構成ファイル作成済み (Windows での実施待ち)
 
 ## 決定事項
 
@@ -74,13 +74,19 @@ python3 -X utf8 -m api.serve --env-file ~/tarot/tarot.env
 - セッションと実行中ジョブはメモリ上 (再起動で消える) — 従来どおり
 - セッション期限切れ後も SSH 接続は保持される (実行中ジョブが参照するため。ログアウトで解放)
 
-## Phase 3 — Windows Server の構築 (手順書を作成)
-- [ ] 改名、固定 IP、Windows Update の再起動時間帯の制御 (ワーカーで同時脱落の事故あり)
-- [ ] Python 3.11 x64、git (`core.autocrlf=false`)、clone、venv
-- [ ] サービス化 (WinSW または NSSM)。停止時に graceful shutdown を待つ設定にする
-- [ ] リバースプロキシ (Caddy または IIS+ARR): TLS、SSE のバッファリング無効化、数 GB のアップロード許可、長いタイムアウト、実 IP の転送
-- [ ] Windows ファイアウォール: 受信は 443 のみ (8000 は外に開けない)
-- [ ] ワーカー用の秘密鍵を配置し、NTFS の ACL でサービスアカウントのみ読めるようにする
+## Phase 3 — Windows Server の構築 (手順書作成済み・実施待ち)
+手順書: `tarot-analyzer/deploy/windows/README.md`。ゴールは「空の DB で API と Caddy が起動し、
+LAN 内から HTTPS のログイン画面が出る」まで。**本物の DB とワーカー鍵での起動は Phase 5/6**
+(ディスパッチャの二重起動を防ぐため)。
+- [x] 構成ファイル: `setup.ps1` (冪等・Windows 上で api テストも実行)、WinSW のサービス定義 2 つ、`Caddyfile`、`worker_known_hosts`
+- [x] `api/requirements.txt` に漏れていた asyncssh を追加し、版を固定
+- [x] `tools/manage_accounts.py` (最初の管理者の作成・ロール変更)
+- [x] ホスト鍵の固定を honban で実機確認 (正しい鍵 → 接続 / 誤った鍵 → 拒否)
+- [ ] GitHub へ push (Windows は読み取り専用デプロイキーで clone)
+- [ ] Windows で README の手順 1〜10 を実施
+- 決定 (2026-09-28): 管理者の操作は **172.20.17.99 のみ** (`TAROT_TRUSTED_NETWORKS=172.20.17.99/32`)。
+  管理 API と Dorado もこの 1 台からのみになる。172.20.17.99 には hosts でホスト名 → 172.20.17.124 を登録 (ヘアピン NAT 対策)
+- 決定: 旧 admin 5 アカウント (kaoki / kaoki_bsi / kaoki_temp / Yamaguchi / Toho_omori) は user に戻した (Mac の DB に適用済み。バックアップ `api/data/tarot.db.bak-20260928_105257`)。管理者は新規作成する
 
 ## Phase 4 — データ移行
 - [ ] `tarot.db` (アカウント / グループ / ワーカー / ジョブ履歴 / 表示名 / メタデータ)
