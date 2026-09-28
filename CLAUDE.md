@@ -4048,3 +4048,53 @@ HTTP からの利用だけを止める。
 `api/tests/test_internet_facing_security.py`, `api/tests/test_tenant_isolation_inputs.py`,
 `frontend/src/pages/Login.tsx`, `frontend/src/components/TotpQr.tsx`,
 `frontend/src/components/AccountAdminPanel.tsx`, `deploy/tarot.env.example`
+
+### 63. 院外の利用者の pod5 をブラウザから受けて Dorado に回す (分割アップロード)
+**背景 (2026-09-28)**: インターネット公開 (#61/#62) で院外の施設が使うが、院外の利用者は
+NAS に pod5 を置けない。Dorado のパス指定と pod5 フォルダの閲覧はワーカー上の任意の
+ディレクトリに触れるので院内 LAN 限定のまま残し、**ブラウザから自分のグループへ
+アップロードした pod5 だけ**を院外から指定できるようにした (`pod5_upload_id`)。
+ブランチ `feature/pod5-upload` (作業フォルダ `wt-pod5-upload/`)。
+
+**サーバー (`api/services/pod5_upload.py`)**:
+- **チャンクは「offset の位置に書く」**。同じチャンクを何度送っても結果が同じなので、
+  回線断は再送、食い違いは `409 {code: offset_mismatch, size}` で受信済みサイズに合わせる。
+  SSH の再接続・再試行 (`_run_with_retry`) にもそのまま乗る。穴 (offset > 受信済み) は拒否。
+- **書きかけは `<name>.pod5.partial`**。最終チャンクで rename する。Dorado は `*.pod5` しか
+  拾わないので、realtime で basecalling と並走しても書きかけを掴まない。
+- **受付中の目印 `.tarot_upload_open`**。これがある間、Dorado の realtime 監視は
+  「新しい pod5 が 10 分来ない」で打ち切らない (`_upload_open`)。送信完了で消す。
+- **ファイル操作はすべて SFTP** (makedirs / readdir / rename / rmtree)。シェルの文字列を
+  組み立てないのでコマンド注入の余地が無く、Mac のローカル SFTP サーバーでテストできる
+  (Mac の find には `-printf` が無い)。
+- **`sftp.open(path, pflags_or_mode=<数値>)` は既定でテキスト (utf-8) として開く。**
+  `encoding=None` を付けないと bytes の書き込みで落ちる (実 SFTP のテストで発見)。
+- 置き場所は `{グループのルート}/pod5_uploads/{YYYYMMDD_HHMMSS_hex8}/` に固定し、
+  削除前に台帳のパスがこの形であることを確かめる (rmtree の誤爆防止)。
+- 送信完了から `retention_days` (30) 日、受付中のまま `abandon_days` (7) 日で自動削除。
+  読んでいる Dorado ジョブが動いている間は消さない。設定は `config.yaml` の `dorado.upload`。
+- GPU はグループあたり同時 1 本 (`dorado.max_concurrent_basecalling_per_group`)。
+  全体の枠 (`max_concurrent_basecalling`) の手前で掛かる。
+- Dorado ジョブの `config_overrides` も通常のジョブと同じ許可リスト (#62)。院外に開いた
+  経路から下流解析の `--config` へそのまま渡るため。
+
+**画面 (`frontend/src/lib/pod5Upload.ts`)**: 進行管理は React の外の常駐ストアに置き、
+画面を移動しても送信を続ける。ページを閉じると File の参照が失われて止まるが、
+受信済みの分はサーバーに残るので、同じフォルダを選び直せば続きから送れる
+(`syncFromServer` が完成済みを飛ばし、書きかけは受信済みサイズから再開)。
+- 逐次送信は **2 分間書き込みの無い** pod5 だけを送る (MinKNOW が書き込み中のファイルを
+  送ると、Dorado が短いファイルを処理済みにしてしまい後から伸びた分が失われる)。
+  「シーケンス終了」の後は、前回のスキャンから変化が無いものを送る。
+- 送信完了前に batch ジョブを作らせない (起動時のスナップショット 1 回きりなので、
+  残りのファイルが黙って取りこぼされる)。サーバーも 409 で拒否する。
+
+**検証の型**: テストの中で `asyncssh.listen(..., sftp_factory=SFTPServer(chroot=tmp))` を
+立てると、本物の SFTP の offset 書き込み・rename・readdir をモック無しで通せる。
+画面の確認も同じ SFTP サーバーを本番アプリにつないだ検証用サーバーで行い、
+送ったファイルを**バイト単位で照合**した (規則的なバイト列を使うと照合が簡単)。
+**該当ファイル**: `api/services/pod5_upload.py`, `api/routers/pod5_upload.py`,
+`api/routers/dorado.py`, `api/services/dorado_runner.py` (`_gpu_slot` / `_upload_open`),
+`api/services/account_store.py` (`pod5_uploads`), `config/config.yaml` の `dorado.upload`,
+`api/tests/test_pod5_upload.py`, `api/tests/test_dorado_create_access.py`,
+`api/tests/test_dorado_group_gpu_slot.py`, `frontend/src/lib/pod5Upload.ts`,
+`frontend/src/components/Pod5UploadPanel.tsx`, `frontend/src/pages/NewJob.tsx`
