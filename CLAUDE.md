@@ -4108,3 +4108,56 @@ SSE (ログのストリーム) はイベントごとに処理し、ダウンロ�
 `api/tests/test_pod5_upload.py`, `api/tests/test_dorado_create_access.py`,
 `api/tests/test_dorado_group_gpu_slot.py`, `frontend/src/lib/pod5Upload.ts`,
 `frontend/src/components/Pod5UploadPanel.tsx`, `frontend/src/pages/NewJob.tsx`
+
+### 64. mlst 同梱の PubMLST DB は未認証取得 — 2025 年以降の登録分が丸ごと見えない
+**発端 (2026-09-30)**: TMUH の *E. faecium* 23 検体が全て ST 未決定
+(`atpA7-ddl1-gdh1-purK1-gyd12-pstS(~1)-adk1`)。pstS は 23 検体とも全長 583 bp で
+pstS_1 から C223T の 1 塩基置換 (CGT→TGT, Arg→Cys) のみ・配列は完全同一。
+生リードは 5 検体で 9〜29 リードの **100% が T** (両鎖) = ONT の系統誤読ではない。
+PubMLST の配列照会 API で **pstS_261 と完全一致**し、プロファイルは
+**ST2822 (CC17, ST132 の SLV)** に一意に決まった。
+**原因**: mlst 2.33.1 同梱 DB (3 ワーカー同一) は `*_info.json` が
+`"authenticated": false`。**PubMLST / BIGSdb Pasteur はログインしていない利用者に
+2024-12-31 以前の登録データしか返さない** (API 応答の `message` に明記。
+`records` は全件数を返すのでプロファイル表の行数と食い違う)。
+**上流 mlst の master も同じ未認証取得**なので、mlst を更新しても直らない。
+実測: 162 スキーム中 114 で計 29,141 ST (12%) が欠落
+(salmonella −2,457 / klebsiella −1,988 / saureus −1,971 / paeruginosa −1,863 /
+abaumannii_2 −837 / efaecium −421 / ecloacae −306)。**Klebsiella は Pasteur 側**
+(ほか ecoli・listeria_2・cdiphtheriae 等 計 9 スキーム) で、鍵は PubMLST と別に要る。
+**対処**: `tools/update_pubmlst_db.py` (fetch → blastdb → verify → compare → apply)。
+- 認証は公式の `bigsdb-downloader` (OAuth 1.0a)。honban の独立 venv
+  `~/venvs/bigsdb-downloader` に導入 (**共有 py39 には入れない**)。トークンは
+  `~/.bigsdb_tokens`。初回 `--setup` は鍵とブラウザ認可が要るので人が対話で行う。
+- **成否は件数で判定する。** 制限付きでも応答は 200 で成功に見えるので、
+  「プロファイル行数 == `records`」を満たさないスキームは失敗にする (#29.1)。
+  downloader は書き込み失敗でも exit 0 なのでファイルの実在も見る。
+- 書き出しは **API 出力そのまま** (同梱 DB と 4 スキームでバイト一致を確認済み)。
+  スキーム名と一覧は現行 DB から引き継ぐ (`scheme_map` が名前で引くため)。
+  座位より後ろの列が mlst の除外名 (`ST|mlst_clade|clonal_complex|species|CC|Lineage`)
+  以外だと mlst が座位と誤認するので、fetch で弾く。
+- DB は NAS の日付き新ディレクトリに作り、`config.mlst.datadir` / `blastdb` で指す
+  (**組で指すこと** — 片方だけだとルールが止まる)。空なら従来どおり同梱 DB。
+  parse_mlst のプロファイル表も datadir に追従する (`db_dir` が空のとき)。
+- 既存検体は `compare` で新旧 DB を**最終判定 (parse_mlst.build_result) まで通して**
+  比較し、`apply` で mlst.tsv を差し替え → `backfill_mlst.process` で JSON と
+  レポートの mlst セクションだけ作り直す (一覧の行キャッシュは mtime で自動再生成)。
+- **踏んだ PubMLST 側の仕様**: mhominis_3 は主キー列が `ST` → `eST` に改名されていた
+  (API の `primary_key_field` と一致するときだけ `ST` に読み替える)。
+  aphagocytophilum は同梱 DB の時点から付随列 `MLST_cluster` を持つ (現行にある列は許容)。
+- **実施 (2026-09-30)**: `pubmlst_20260930` (NAS `db/pubmlst_mlst/`, 327 MB) に切替済み。
+  ST 207,537 → 233,558。既存 ST/アリルの訂正は cdifficile (ST461/463 削除)・neisseria
+  (アリル変更 14 / 削除 1)・providencia (5)・chlamydiales (1) のみ。NAS 全 1,625 検体を
+  新旧で比較し **新規に型が付く 26 件 / 既存 ST の変化・消失 0 件**
+  (旧 DB での回し直しは 1,625 件すべて保存値と一致)。26 件は apply 済み
+  (退避は `pubmlst_20260930/_apply_backup_*`)。新 DB でも型が付かない 54 件に
+  Klebsiella は 0 件 = Pasteur 鍵が無くても現検体への影響は無い。
+  S. aureus 3 件 (toho_omori 22700/22708/22719) は全座位が既知アリルなのに ST 未登録。
+- 取得ツールは honban の `~/pubmlst_tool/` に写しを置いて実行した (tools/ は同期対象外)。
+  再取得は `fetch` が `.fetched.json` の済んだスキームを飛ばすので、新しい日付の
+  `--out` を切って流す。Pasteur 鍵が来たら `--key_name Pasteur --site Pasteur` で
+  `--setup` し、同じ手順で取り直す。
+- mlst を直接呼ぶ `tools/backfill_missing_references.py` /
+  `tools/promote_inhouse_reference.py` は同梱 DB のまま (未対応)。
+**該当ファイル**: `tools/update_pubmlst_db.py` (新規), `workflow/rules/stage1_mlst.smk`,
+`config/config.yaml` の `mlst.datadir` / `mlst.blastdb`
