@@ -1,6 +1,6 @@
 # オーケストレーターの Windows Server 2025 移行 + インターネット公開
 
-作成: 2026-09-28 / 状態: Phase 1・2 完了、Phase 3 の手順書・構成ファイル作成済み (Windows での実施待ち)
+作成: 2026-09-28 / 状態: Phase 1〜3 完了 (2026-09-29)。次は Phase 4
 
 ## 決定事項
 
@@ -74,7 +74,7 @@ python3 -X utf8 -m api.serve --env-file ~/tarot/tarot.env
 - セッションと実行中ジョブはメモリ上 (再起動で消える) — 従来どおり
 - セッション期限切れ後も SSH 接続は保持される (実行中ジョブが参照するため。ログアウトで解放)
 
-## Phase 3 — Windows Server の構築 (手順書作成済み・実施待ち)
+## Phase 3 — Windows Server の構築 (完了 2026-09-29)
 手順書: `tarot-analyzer/deploy/windows/README.md`。ゴールは「空の DB で API と Caddy が起動し、
 LAN 内から HTTPS のログイン画面が出る」まで。**本物の DB とワーカー鍵での起動は Phase 5/6**
 (ディスパッチャの二重起動を防ぐため)。
@@ -82,8 +82,18 @@ LAN 内から HTTPS のログイン画面が出る」まで。**本物の DB と
 - [x] `api/requirements.txt` に漏れていた asyncssh を追加し、版を固定
 - [x] `tools/manage_accounts.py` (最初の管理者の作成・ロール変更)
 - [x] ホスト鍵の固定を honban で実機確認 (正しい鍵 → 接続 / 誤った鍵 → 拒否)
-- [ ] GitHub へ push (Windows は読み取り専用デプロイキーで clone)
-- [ ] Windows で README の手順 1〜10 を実施
+- [x] GitHub へ push (Windows は読み取り専用デプロイキーで clone)
+- [x] Windows で README の手順 1〜10 を実施。TAROT-ORCH で TarotApi / TarotCaddy が .\tarot-svc で稼働、
+  443 のみ開放、172.20.17.99 のブラウザでログイン画面の表示を確認。証明書は**仮の自己署名** (tarot-orch.lan, 90 日)
+- 実施中に分かったこと (手順書に反映済み):
+  - 院内の途中の機器が**送信元ポート 123 番の NTP を落とす**ため w32tm は外部に届かない → 時刻源は NAS (172.20.17.58) の NTP サーバー機能。NAS は stratum 9 (自分の時計基準) を名乗っている
+  - ssh-keyscan は kibanb/tugrip のフォワーダー迂回経路の遅れで失敗する → ssh + `UserKnownHostsFile` で照合 (3 台一致)
+  - kibanb/tugrip が 9/17 の再起動後、ログオン待ちでフォワーダーが起動せず **12 日間ワーカー不在**だった。自動再起動はポリシーで停止済み
+- 残り (Phase 3 の外):
+  - [ ] 情報部門へ申請: .124 のまま公開できるか / ドメイン名と証明書 / 443 転送の時期 / UDP 123 の許可
+  - [ ] kibanb/tugrip のフォワーダーをログオン無しで起動させる (AtStartup + 非ログオン実行で wsl.exe hold が動くか要検証)
+  - [ ] kibanb/tugrip の localhost relay が毎回失敗し NAT 迂回になっている (`relay-fallback-nat`) 件の調査
+  - [ ] 管理者の作成 (`tools/manage_accounts.py create-admin`、Mac の DB に対して)
 - 決定 (2026-09-28): 管理者の操作は **172.20.17.99 のみ** (`TAROT_TRUSTED_NETWORKS=172.20.17.99/32`)。
   管理 API と Dorado もこの 1 台からのみになる。172.20.17.99 には hosts でホスト名 → 172.20.17.124 を登録 (ヘアピン NAT 対策)
 - 決定: 旧 admin 5 アカウント (kaoki / kaoki_bsi / kaoki_temp / Yamaguchi / Toho_omori) は user に戻した (Mac の DB に適用済み。バックアップ `api/data/tarot.db.bak-20260928_105257`)。管理者は新規作成する
