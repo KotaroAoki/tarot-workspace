@@ -91,7 +91,7 @@ LAN 内から HTTPS のログイン画面が出る」まで。**本物の DB と
   - kibanb/tugrip が 9/17 の再起動後、ログオン待ちでフォワーダーが起動せず **12 日間ワーカー不在**だった。自動再起動はポリシーで停止済み
 - 残り (Phase 3 の外):
   - [ ] 情報部門へ申請: .124 のまま公開できるか / ドメイン名と証明書 / 443 転送の時期 / UDP 123 の許可
-  - [ ] kibanb/tugrip のフォワーダーをログオン無しで起動させる (AtStartup + 非ログオン実行で wsl.exe hold が動くか要検証)
+  - [x] kibanb/tugrip のフォワーダーをログオン無しで起動させる (AtStartup トリガー + LogonType=Password。両機とも再起動・非ログオンで復帰と 9 分後の WSL 継続を実機確認)
   - [ ] kibanb/tugrip の localhost relay が毎回失敗し NAT 迂回になっている (`relay-fallback-nat`) 件の調査
   - [ ] 管理者の作成 (`tools/manage_accounts.py create-admin`、Mac の DB に対して)
 - 決定 (2026-09-28): 管理者の操作は **172.20.17.99 のみ** (`TAROT_TRUSTED_NETWORKS=172.20.17.99/32`)。
