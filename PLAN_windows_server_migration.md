@@ -92,7 +92,7 @@ LAN 内から HTTPS のログイン画面が出る」まで。**本物の DB と
 - 残り (Phase 3 の外):
   - [ ] 情報部門へ申請: .124 のまま公開できるか / ドメイン名と証明書 / 443 転送の時期 / UDP 123 の許可
   - [x] kibanb/tugrip のフォワーダーをログオン無しで起動させる (AtStartup トリガー + LogonType=Password。両機とも再起動・非ログオンで復帰と 9 分後の WSL 継続を実機確認)
-  - [ ] kibanb/tugrip の localhost relay が毎回失敗し NAT 迂回になっている (`relay-fallback-nat`) 件の調査
+  - [x] kibanb/tugrip の localhost relay 失敗 (`relay-fallback-nat`) = フォワーダー v2.6 が再起動時に wslrelay を殺していた。v2.7 を両機に配置し、稼働中の再起動でも `preflight=localhost-relay`・ssh-keyscan 0.2 秒を確認 (原本 `tarot-analyzer/deploy/workers/`)
   - [ ] 管理者の作成 (`tools/manage_accounts.py create-admin`、Mac の DB に対して)
 - 決定 (2026-09-28): 管理者の操作は **172.20.17.99 のみ** (`TAROT_TRUSTED_NETWORKS=172.20.17.99/32`)。
   管理 API と Dorado もこの 1 台からのみになる。172.20.17.99 には hosts でホスト名 → 172.20.17.124 を登録 (ヘアピン NAT 対策)
