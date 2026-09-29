@@ -4161,3 +4161,40 @@ abaumannii_2 −837 / efaecium −421 / ecloacae −306)。**Klebsiella は Past
   `tools/promote_inhouse_reference.py` は同梱 DB のまま (未対応)。
 **該当ファイル**: `tools/update_pubmlst_db.py` (新規), `workflow/rules/stage1_mlst.smk`,
 `config/config.yaml` の `mlst.datadir` / `mlst.blastdb`
+
+### 65. 追加シーケンス (top-up run) の pod5 を既存検体とマージする
+**動機 (2026-09-30)**: ONT は深度が足りないとき同じ検体を追加で読む。従来は同じ
+サンプル ID で Dorado に再投入すると**新しいランのリードだけで解析し直して既存の結果を
+置き換えていた** (旧リードは NAS に残っているのに使われない)。
+**方針 (ユーザー決定)**: ID 一致で自動提案 / 被覆は旧+新の合算で判定 / 結果は同じ ID で
+置き換え / 重複はファイル名ではなくリード ID で除去。
+- **旧リードの在処は `results/{sample}/input_class.json` の `long_reads`**。classify_input が
+  `Path.resolve()` した実体パスを書くので、前回のマージで張ったリンクも実体に解決済み =
+  マージを重ねても連鎖しない。実測 NAS の長鎖検体 692 件中 691 件で今も読める。
+- **旧リードはコピーしない。** 下流の入力 (`dorado_samples/{job}/{sample}/`) に
+  **相対**シンボリックリンク `{sample}_prior01.fastq.gz` を張るだけ (#35)。classify_input は
+  フォルダ内の fastq を全部使う (#60.1)。measure.sh の「目的の fastq 以外を消す」掃除から
+  このリンクを除外してある (`PRIOR_LINK_GLOB`)。記録は同じ場所の `merge_info.json`。
+- **重複除去は新リード側から**旧リードにある ID を落とす (旧リードは触らない)。新リードが
+  全部重複なら再解析しない (`no_new_reads` / downstream `skipped`)。
+- **マージを頼まれたのにできないバーコードは下流を起動しない** (`unavailable`)。
+  旧リード欠損・Illumina/assembly/hybrid 検体・確認失敗が該当。新リードだけで進めると
+  **既存の結果を被覆の低い結果で置き換える**ため。hybrid は SPAdes の contig しか使わず
+  長鎖リードを足しても解析に入らない (#37.4) ので対象外。
+- **既存リードだけで閾値以上の検体は早期起動しない** (全 pod5 の basecall 後に起動)。
+  そうしないと新リードが 1 本入った瞬間に「到達」し、追加で読んだ分を捨てる。
+- 下流は従来どおり `force_rerun=False` の新ジョブ (account モードはスクラッチが毎回新規)。
+  NAS へのアーカイブは `_replace_modules_cmd` で作り直したモジュールだけ置き換わる。
+  cgSNP の BAM と plasmid DB (#42.5) は再解析で更新される。**プラスミド関連性は
+  グループ全体で回し直すこと** (#42.1)。
+- 画面: New Job のバーコード表に「既存検体」列 (`POST /api/dorado/merge-candidates` で
+  0.6 秒デバウンスして照会)。未指定は「自動 = オン」で送る — 既存検体が無ければ
+  サーバーは通常どおり解析するので害が無い。Dorado 詳細に内訳と「起動せず」の理由。
+**該当ファイル**: `api/services/read_merge.py` (新規・シェル断片と判定の純関数),
+`api/services/dorado_runner.py` (`_inspect_merge_sources`, `lookup_merge_candidates`,
+`_resolve_merge_sources`, `_mark_merge_unavailable`, measure.sh への差し込み,
+`_prepare_and_launch_downstream` のリンク処理, `skipped` の扱い),
+`api/routers/dorado.py` (`/merge-candidates`), `api/models/schemas.py`,
+`api/tests/test_dorado_read_merge.py` (シェル断片と DoradoRunner の measure.sh を手元の
+bash で実行する), `frontend/src/pages/NewJob.tsx` (`MergeCell`),
+`frontend/src/pages/DoradoJobDetail.tsx` (`MergeNote`), `frontend/src/lib/api.ts`, locales
