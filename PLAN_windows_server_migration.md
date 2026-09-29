@@ -108,6 +108,9 @@ LAN 内から HTTPS のログイン画面が出る」まで。**本物の DB と
 - [x] `TAROT_WORKER_SSH_KEY` を設定して再起動 (`Registered 3 worker(s) into SSH pool`)
 - [x] tarot_admin で 172.20.17.99 からログイン → MFA 登録 → 管理画面
 - [x] kaoki でログイン → MFA 登録 → Results 表示 / 小さな FASTA のジョブ 1 本が完走
+- [x] 大容量アップロード (Caddy 経由) / HTML 書き出し・A4 PDF / cgSNP 再実行 / 利用申請 → 管理者承認
+- [ ] Dorado (院内 pod5 フォルダ指定、172.20.17.99 から)
+- [ ] 院外からの見え方 (.99 以外の端末: パス秘匿・Dorado フォルダ指定なし・管理画面 403)
 - [ ] **ディスパッチャが 2 つにならないようにする**: Windows 側はテスト用ワーカー 1 台に限定するか、Mac 側を閲覧専用にする
 - [ ] ログイン (MFA) → アップロード (大容量を含む) → ジョブ → SSE ログ → 結果 → cgSNP → dorado → HTML / PDF 出力
 - [ ] 院外を想定した回線 (モバイル回線等) から疎通を確認
