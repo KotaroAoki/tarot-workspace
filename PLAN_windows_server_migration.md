@@ -1,6 +1,6 @@
 # オーケストレーターの Windows Server 2025 移行 + インターネット公開
 
-作成: 2026-09-28 / 状態: Phase 1〜3 完了 (2026-09-29)。次は Phase 4
+作成: 2026-09-28 / 状態: Phase 1〜4 完了、Phase 5+6 を統合して実施中 (2026-09-29)。**Mac の API は停止したまま起動しない**
 
 ## 決定事項
 
@@ -98,12 +98,16 @@ LAN 内から HTTPS のログイン画面が出る」まで。**本物の DB と
   管理 API と Dorado もこの 1 台からのみになる。172.20.17.99 には hosts でホスト名 → 172.20.17.124 を登録 (ヘアピン NAT 対策)
 - 決定: 旧 admin 5 アカウント (kaoki / kaoki_bsi / kaoki_temp / Yamaguchi / Toho_omori) は user に戻した (Mac の DB に適用済み。バックアップ `api/data/tarot.db.bak-20260928_105257`)。管理者は新規作成する
 
-## Phase 4 — データ移行
-- [ ] `tarot.db` (アカウント / グループ / ワーカー / ジョブ履歴 / 表示名 / メタデータ)
-- [ ] ワーカー用の SSH 秘密鍵、env ファイル
-- [ ] ワーカー側で新サーバーの IP からの SSH を許可 (forwarder / sshd の許可リスト)
+## Phase 4 — データ移行 (完了 2026-09-29)
+- [x] `tarot.db` を sqlite の `.backup` で書き出し USB で移送 (グループ 11 / アカウント 11 / ワーカー 3 / ジョブ 576)。DB に Mac ローカルのパスは無い。起動時、実行中・待機中だった 13 件は履歴 (中断) として復元されるだけで再投入はされない
+- [x] ワーカー用の SSH 秘密鍵を `C:\TAROT\secrets\tarot_orchestrator` に配置 (tarot-svc が読める ACL。Windows の ssh は他ユーザーが読める鍵を `bad permissions` で拒むので、手動確認は管理者専用の一時コピーで行う)
+- [x] 新サーバー (.124) から 3 台すべてに SSH で入れ NAS が見えることを確認 (許可リストの変更は不要だった)
+- 決定: **Mac の API は止めたまま**にし、Phase 5 と 6 を統合する (二重ディスパッチの心配が無く、MFA 登録も消えない)
 
-## Phase 5 — 並行検証
+## Phase 5 — 検証 (Phase 6 と統合)
+- [x] `TAROT_WORKER_SSH_KEY` を設定して再起動 (`Registered 3 worker(s) into SSH pool`)
+- [x] tarot_admin で 172.20.17.99 からログイン → MFA 登録 → 管理画面
+- [x] kaoki でログイン → MFA 登録 → Results 表示 / 小さな FASTA のジョブ 1 本が完走
 - [ ] **ディスパッチャが 2 つにならないようにする**: Windows 側はテスト用ワーカー 1 台に限定するか、Mac 側を閲覧専用にする
 - [ ] ログイン (MFA) → アップロード (大容量を含む) → ジョブ → SSE ログ → 結果 → cgSNP → dorado → HTML / PDF 出力
 - [ ] 院外を想定した回線 (モバイル回線等) から疎通を確認
