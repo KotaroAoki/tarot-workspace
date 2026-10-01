@@ -4198,3 +4198,152 @@ abaumannii_2 −837 / efaecium −421 / ecloacae −306)。**Klebsiella は Past
 `api/tests/test_dorado_read_merge.py` (シェル断片と DoradoRunner の measure.sh を手元の
 bash で実行する), `frontend/src/pages/NewJob.tsx` (`MergeCell`),
 `frontend/src/pages/DoradoJobDetail.tsx` (`MergeNote`), `frontend/src/lib/api.ts`, locales
+
+### 66. honban の SSH 接続が 5 分ごとに全部切れていた (portproxy の張り直し)
+**症状 (2026-09-30)**: TMUH の 42 検体を Results から cgSNP 実行したら
+「29 件開始 (13 件はジョブが見つからず除外: VRE30〜VRE42)」。13 件の
+`report/*_report.json` は NAS に実在していた。
+**原因 (2 段)**:
+1. honban の Windows タスク `WSL-SSH-PortProxy-Keepalive` が 5 分ごとに
+   `C:\Scripts\wsl-ssh-portproxy.ps1` を実行し、ルールが同じでも毎回
+   `netsh interface portproxy delete` → `add` していた。**ルールを消すと、それを通る
+   TCP 接続は全部切れる。** honban の `/var/log/auth.log` では、オーケストレーターの
+   接続が開いた時刻に関係なく**毎回 xx:x0:01 / xx:x5:01 に閉じていた**
+   (2026-06-15 から)。42 検体の存在確認の途中、12:45:01 に切られた。
+   同じスクリプトが `New-NetFirewallRule` も毎回呼んでおり、同名の規則が
+   **29,848 個**に増えていた (DisplayName は一意ではない)。
+2. `sftp_exists` は再接続せず、しかも `SFTPError` をまとめて False にしていた。
+   **`SFTPConnectionLost` / `SFTPNoConnection` は `SFTPError` のサブクラス**なので、
+   切断が「存在しない」に化ける。呼び出し側 (`/core_snp/by-samples`) も例外を
+   「無い」として扱い、「ジョブが見つからず除外」と誤表示した (#28 と同型)。
+**対処**:
+- スクリプト v2 (原本 `deploy/workers/wsl-ssh-portproxy.ps1`): レジストリ
+  (`HKLM:\...\PortProxy\v4tov4\tcp`, ロケール非依存) の現行ルールが WSL の IP と
+  一致すれば何もしない。ファイアウォール規則は無いときだけ作る。
+  配置後、12:55:01 のタスク実行を越えて接続が残ることを auth.log で確認済み。
+- `sftp_paths_exist()` (1 本の SFTP セッションでまとめて確認、`_run_with_retry` で
+  再接続して最初から確認し直す) を追加し、`sftp_exists` もこれを通す。切断は例外として
+  上げる。by-samples は確認失敗を `check_failed` として返し、画面は「確認できず未実行」と
+  別の文言で出す。テストは本物の SFTP サーバーで途中切断を再現している。
+**残り**: 重複したファイアウォール規則の削除は管理者権限が要る (未実施)。
+kibanb / tugrip のフォワーダー (#61 以前からの `wsl-ssh-forwarder.ps1`) は
+`RELAY_MAX_AGE_MIN = 30` で**30 分より古いリレーのクライアントソケットを閉じる**ので、
+長命の SSH 接続は同じ理由で 30 分ごとに切られている可能性がある (未確認)。
+**該当ファイル**: `deploy/workers/wsl-ssh-portproxy.ps1` (新規), `deploy/workers/README.md`,
+`api/services/ssh_manager.py` (`sftp_paths_exist`, `sftp_exists`),
+`api/routers/jobs.py` (`run_core_snp_by_samples` の `check_failed`),
+`api/tests/test_sftp_paths_exist.py` (新規), `frontend/src/pages/Results.tsx`,
+`frontend/src/lib/api.ts`, `frontend/src/lib/locales/{ja,en}.ts`
+
+### 67. Cancel が効かないまま「キャンセル済み」になり、再実行と並走して結果を壊した
+**経緯 (2026-09-30, TMUH の VRE 42 検体)**: 29 件で走っていた on-demand cgSNP を
+Cancel したが、ワーカー上の snakemake は止まっていなかった。直後の再実行は
+29 件 + 13 件の 2 本に割れ、しかも 29 件側が**止まっていない snakemake と同じ
+作業ディレクトリ・同じ検体で並走**した。VRE13 は並行処理で途中のファイルを
+消されて失敗し、VRE22 / VRE25 も同時に処理された。止まっていない方は手で
+`kill -- -PGID` して収拾した。オーケストレーターのログ (TAROT-ORCH の
+`C:\TAROT\logs\tarot-api.err.log`) で原因を 4 つ特定した:
+1. **同時チャネル数の上限。** Cancel を押した瞬間、同じ接続で画面の読み込みが
+   SFTP を 10 本開いていた。sshd の `MaxSessions` (既定 10) に当たり、kill の
+   チャネルが `open failed` で開けなかった。ログでは 74 番以降のチャネルが
+   開いた瞬間に閉じている。
+2. **Cancel が失敗を握りつぶしていた。** kill の例外を `except: pass` で捨て、
+   止まったか確かめずに「cancelled」と記録していた (#36.1 の穴)。
+3. **ロック解除が走行中のプロセスを見ていなかった。** `_unlock_remote` の
+   `--unlock` は `samples` を渡しておらず `/path/to/your/samples` で**一度も
+   成功していなかった**。後ろの `rm -rf .snakemake/locks/*` が無条件に走り、
+   動いている snakemake のロックを消して並走を許した。
+4. **キャンセルが FAILED に上書きされ、再利用された。** `_run_core_snp_batch` の
+   「切断後の待ち直し」が、待ちの間にキャンセルされたかを見ずに FAILED を
+   書いていた。by-samples の Step 1 は FAILED の臨時ジョブを「過去のジョブ」
+   として拾い、選んだ検体が 2 本に割れた。
+さらに `ensure_alive` / keepalive は「チャネルが開けない」を切断と見なして
+接続を張り直しており、そのたびに開いていた SFTP が全部切れ、また張り直す
+連鎖になっていた (ログの 13:00:49〜13:00:53)。
+
+**対処**:
+- A: `_stop_remote_pgid` = TERM → 最大 10 秒待つ → KILL → **`kill -0` で消えたかを
+  1 行で報告**するコマンドを、`exec_command_retry` (待ち・再接続・再実行) で流す。
+  確認できなければ `job.cancel_unconfirmed = True` と PGID 付きの `error_message` を
+  残し、ロックは消さず、`_retry_stop_until_gone` が 30 秒おきに 10 分間止め直す。
+  ハング検知の `_kill_remote_and_unlock` も同じ関数を使う。
+  **状態を RUNNING に戻す案は採らなかった** — 監視ループは CANCELLED を見て抜けるので、
+  戻すと監視の無い RUNNING が残る。代わりに「止められていない」ことを表示で言う。
+- B: `_unlock_command` は、同じ cwd (`/proc/<pid>/cwd`) の snakemake がいれば
+  `[unlock] SKIPPED` を返してロックを残す。`--unlock` には
+  `--config samples=_unlock_ input_dir=results results_dir=results` を渡す。
+  pgrep のパターンは `bin/snakemak[e]` (このコマンド自身の bash に一致させない)。
+  **判定はそのワーカー上のプロセスだけ** — NAS 上の同じディレクトリを別ワーカーが
+  使っている場合は見えない (cgSNP は orchestrator 側の run_lock で直列化されている)。
+- C: `ssh_manager` に接続 (token) ごとのセマフォ (`TAROT_SSH_MAX_CHANNELS`、既定 6)。
+  exec / SFTP の短命チャネルはこれを通す。監視ストリーム (`open_process`) と
+  死活確認は通さない (長く握るので、通すと短命の処理が詰まる)。その分の余裕として
+  上限を 10 より小さくしてある。`ChannelOpenError` で**接続が生きている**場合は
+  `_is_channel_busy` とみなし、張り直さずに待って開き直す (`_run_with_retry`)。
+  `ensure_alive` と keepalive も張り直さない。
+- D: 待ち直しの間にキャンセルされたら FAILED を書かない。by-samples は
+  臨時ジョブ (`adhoc_*`) を再利用せず、選んだ検体を 1 本の新しいジョブにまとめる。
+  `cancel_unconfirmed` のジョブに含まれる検体は 409 で断る。すでに cgSNP 実行中の
+  検体は外して `already_running` で返す。JobDetail はキャンセル送信の失敗を表示する
+  (以前は何も出なかった)。
+
+**検証**: 本物の SSH サーバーで、サーバー側に同時セッション数の上限を持たせて
+試した (`test_ssh_channel_limit.py`)。**対照として、クライアント側で絞らないと
+サーバーが実際にチャネルを拒否することも確かめてある** — これが無いと上限の
+テストは何も確かめていないことになる。停止コマンドとロック解除は honban の
+`/tmp` でダミープロセスを使って確認した (TERM を無視するプロセスは KILL で 12 秒、
+ダミーの snakemake が動いている間は SKIPPED、止めた後は `Unlocking working
+directory.`)。
+**該当ファイル**: `api/services/ssh_manager.py` (`_channel_slot`, `_is_channel_busy`,
+`exec_command_retry`, `_run_with_retry`, `ensure_alive`, `_keepalive_loop`),
+`api/services/snakemake_runner.py` (`_stop_pgid_command`, `_parse_stop_output`,
+`_stop_remote_pgid`, `_retry_stop_until_gone`, `cancel_job`, `_kill_remote_and_unlock`,
+`_unlock_command`, `_run_core_snp_batch`, `JobRecord.cancel_unconfirmed`),
+`api/routers/jobs.py` (`run_core_snp_by_samples` の Step 0 / adhoc 除外),
+`api/models/schemas.py`, `api/tests/test_cancel_stop_confirmation.py` (新規),
+`api/tests/test_ssh_channel_limit.py` (新規), `frontend/src/pages/JobDetail.tsx`,
+`frontend/src/pages/Results.tsx`, `frontend/src/lib/api.ts`, `frontend/src/lib/locales/{ja,en}.ts`
+
+### 68. まとめて再実行する cgSNP は、系統樹を群ごとに 1 回だけ作って配る
+**動機 (2026-10-01)**: `core_snp_phylo` は検体ごとに走るので、同じ群をまとめて
+再実行すると**中身が同じ系統樹を検体の数だけ作り直す**。TMUH の ST2822 (40 株) を
+29 件作り直すのに約 6 時間かかった (1 件 12.5 分 × 29、1 台で直列)。
+**同じ 40 株で独立に 12 回回した結果は、`sample` と `run_timestamp` 以外が完全に
+一致した** (系統樹の枝長・支持値まで)。逆に 1 件ずつのやり方では、途中で BAM DB が
+変わると同じ群に 2 種類の木が混在する (実測: VRE13 の BAM 作り直しの前後で
+95.41% 版と 95.42% 版)。
+
+**適用範囲は Results からの一括実行 (`_run_core_snp_batch`) の「系統解析」段だけ。**
+通常ジョブの検体ごとの系統樹 (#23 の連続監視) は変えていない。
+**流れ**: ① `fanout_core_snp_result.py plan` で群分け (mapping_info.json を読む) →
+② 群ごとの代表 1 件だけを snakemake で解析 → ③ `fanout` で代表の結果を書き写す →
+④ 配れなかった検体だけ「系統解析 (個別)」段で従来どおり解析。
+群分けに失敗したら共有せず全員を従来どおり解析する (遅いだけで正しい)。
+
+**配ってよい条件は `share_decision` 1 か所だけ** (#19)。どれか崩れたら配らない:
+代表の結果が `completed` / **今回の実行で書かれた** (段の開始時刻 `--newer-than`
+より新しい — 代表が失敗して前回の結果が残っているだけ、を防ぐ) /
+`population.forced_in` が偽 (代表が窓の外から入れ替えで入っていない) /
+対象の BAM 作成が DONE / **群・species_dir・参照ゲノム・BAM の置き場が同じ** /
+対象が代表の比較株に入っている。`forced_in` は今回 `collect_bams` に足した印で、
+**それより前の結果には無いので配らない**。
+**代表が失敗したら群の全員を従来どおり 1 件ずつ解析する** (ユーザー決定。
+品質の失敗なら同じ失敗を繰り返すが、NAS の一時エラーのような偶発的な失敗を
+全員に広げないため)。**配るのは選んだ検体だけ** (ユーザー決定) — 選んでいない
+同じ群の検体の結果は書き換えない。
+**配った結果の書き方**: `sample` だけ書き換え、`run_timestamp` は代表の計算時刻の
+まま、`shared_from: {sample, run_timestamp, fanned_out_at}` を必ず付ける。一時
+ファイル + `os.replace`。`logs/{s}/core_snp_phylo.log` に 1 行残す。画面の cgSNP
+カードと HTML 出力に「{代表} の解析を共有」を出す (**黙ると、この検体のために
+計算した木と区別が付かない**)。スクリプトは標準ライブラリのみ (ワーカーの素の
+python3 で動かす。honban の 3.8 で確認済み)。
+**検証**: 実データの写しで、配った結果と 9/30 に独立に計算した結果の差が
+`run_timestamp` / `shared_from` / `forced_in` だけであることを確認した。
+実際の 42 件の群分けは ST2822 (代表 + 39) と ST2158 (代表 + 1)。
+**該当ファイル**: `workflow/scripts/fanout_core_snp_result.py` (新規・判定の単一の真実源),
+`workflow/scripts/run_core_snp_phylo.py` (`collect_bams` の `forced_in`, `population.forced_in`),
+`api/services/snakemake_runner.py` (`_PHYLO_STAGE`, `_plan_shared_phylo`,
+`_fanout_shared_phylo`, `_run_core_snp_batch`), `workflow/tests/test_fanout_core_snp_result.py`
+(新規), `workflow/tests/test_core_snp_population.py`, `api/tests/test_shared_phylo_stage.py`
+(新規), `frontend/src/components/CoreSnpSection.tsx`, `frontend/src/lib/htmlExport.ts`,
+`frontend/src/lib/api.ts`, `frontend/src/lib/locales/{ja,en}.ts`
