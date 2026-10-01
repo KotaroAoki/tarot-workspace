@@ -4347,3 +4347,70 @@ python3 で動かす。honban の 3.8 で確認済み)。
 (新規), `workflow/tests/test_core_snp_population.py`, `api/tests/test_shared_phylo_stage.py`
 (新規), `frontend/src/components/CoreSnpSection.tsx`, `frontend/src/lib/htmlExport.ts`,
 `frontend/src/lib/api.ts`, `frontend/src/lib/locales/{ja,en}.ts`
+
+### 69. 検体メタデータに材料と符号化患者 ID を追加した (一括取り込み・テンプレート)
+**動機 (2026-10-02)**: 検体の由来として材料と符号化患者 ID を取り込みたい、という要望。
+分離日・地域・施設と同じ `sample_metadata` の行に列を足した
+(`specimen` / `specimen_category` / `patient_code`。既存 DB は `_ADDED_COLUMNS` で自動追加)。
+**今回の範囲は保存・取り込み・表示・書き出しの選択まで。** 同一患者の検体どうしの印
+(cgSNP の距離行列・MST / プラスミド距離マップ) と、材料の分類を色分けの軸に足す作業は未着手。
+
+**材料の分類は読み出し時に決める (保存しない)**。判定は `api/services/specimen.py` だけが
+行い (#19)、`_decorate_meta` が `specimen_key` / 日英の分類ラベルを付けて返す。
+保存時に焼き込むと、辞書を直しても既存の値が古いまま残る。`specimen_category` 列は
+**利用者が編集画面で分類を選んだときの上書き専用**で、材料名を書き換えたら外す
+(1 件編集でも一括取り込みでも同じ規則)。辞書に無い材料名はエラーにせず
+「分類不明」(None) のまま残す — 推測で分類を付けるより害が小さい。
+- 13 分類: 血液 / 尿 / 呼吸器 / 便・直腸スワブ / 膿・創部 / 無菌体液 / 胆汁 /
+  カテーテル・デバイス / 生殖器 / その他の臨床検体 / 環境 / 食品 / 動物。
+- **規則は上から順に評価する。** `カテーテル尿` は尿、`尿道分泌物` は生殖器、
+  `血性胸水` は無菌体液、`鶏肉` は食品、`尿道カテーテル先端` はデバイス。
+  限定的な規則を先に置くこと。
+- **英語のキーワードは語単位で照合する。** 部分一致だと `cat` (動物) が `catheter` に、
+  `ear` が `blood smear` に当たる。日本語は部分一致。
+
+**受ける列名を意図的に絞ってある (ユーザー決定)**:
+材料は `材料` / `specimen`、患者 ID は `符号化患者ID` / `patient_code` だけ。
+`患者ID` / `patient_id` / `匿名化ID` / `subject_id` を受けないのは、その名前の列には
+**院内の患者番号がそのまま入っていることが多い**ため (符号化済みであることを列名で
+明示してもらう)。受けない列は**黙って捨てず**、プレビューに「患者 ID として扱いません」と
+理由を出す (`ignored`)。列名の候補を増やすときはこの意図を崩さないこと。
+
+**符号化患者 ID の扱い**:
+- 値は受け取ったまま保存する (照合は施設の対応表で行う前提)。サーバーで再符号化すると
+  画面の値から対応表を引けなくなるので採らなかった。
+- 数字だけ 5 桁以上は「院内の患者番号の疑い」として**弾かずに警告する**
+  (`looks_like_raw_patient_number`。判定は API、`patient_code_numeric` で返す)。
+- **書き出しには既定で含めない。** Results の CSV と A4 レポート / HTML は、書き出すときに
+  チェックしたときだけ載せる (既定オフ・記憶しない)。符号化してあっても対応表があれば
+  仮名加工情報 = 個人情報で、ファイルは院外へ持ち出されうる (#62)。
+- ワーカーや NAS の JSON には配らない (`isolation_dates.json` は分離日だけ)。
+
+**列の誤検出 (同時に直した既存の穴)**: 検体名の列は前方一致まで見るので、`検体` が
+`検体材料` を、`sample` が `Sample_Type` を検体名として拾いうる。`_pick_columns` は
+**全役割の完全一致を先に確定させてから**前方一致に進み、取られた列を他の役割に使わない。
+検体名の前方一致では `材料` / `type` / `specimen` などを含む列を候補から外す。
+
+**取り込みテンプレート**: ダイアログから CSV / TSV をダウンロードできる。
+**列名の正本は `sample_metadata.TEMPLATE_COLUMNS`** で、画面は
+`GET /api/results/sample_metadata/template?lang=` で受け取ってファイルを組み立てるだけ
+(画面に書き写すと、受ける列名を変えたときにテンプレートだけ古く残る)。
+テストがテンプレートの全列を日英 × CSV/TSV で取り込みに通し、元の役割として認識されることを
+縛っている。**記入例の行は入れない** (消し忘れて取り込むと同名の検体に架空の値が入る)。
+Excel で日本語の列名が化けないよう UTF-8 BOM を付ける (取り込み側は BOM を落とす)。
+
+**A4 レポート**: 材料と患者 ID は**登録があるときだけ**見出しに出す (分離日・施設のように
+未登録を「—」で常設しない)。見出しが 1 行増えうるが、登録済みの検体で
+「全検体 A4 1 枚」(#53) は測り直していない。
+**該当ファイル**: `api/services/specimen.py` (新規・分類の単一の真実源),
+`api/services/sample_metadata.py` (`_pick_columns`, `_ignored_columns`,
+`validate_specimen`, `validate_patient_code`, `looks_like_raw_patient_number`,
+`TEMPLATE_COLUMNS`), `api/services/account_store.py`, `api/routers/results.py`
+(`_decorate_meta`, `/specimen_categories`, `/sample_metadata/template`,
+`set_sample_metadata`, `import_sample_metadata`), `api/tests/test_specimen.py` (新規),
+`api/tests/test_sample_metadata_store.py` (新規), `api/tests/test_sample_metadata_import.py`,
+`frontend/src/components/SampleMetadataImportDialog.tsx`,
+`frontend/src/components/SampleMetadataDialog.tsx`, `frontend/src/pages/Results.tsx`,
+`frontend/src/pages/SampleDetail.tsx`, `frontend/src/lib/sampleBrief.ts`,
+`frontend/src/components/SampleBriefView.tsx`, `frontend/src/lib/serverText.ts`
+(`specimenCategoryLabel`), `frontend/src/lib/api.ts`, `frontend/src/lib/locales/{ja,en}.ts`
