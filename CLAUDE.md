@@ -4503,3 +4503,116 @@ long-read 検体には当てていない (#59 の環状接合部の backfill は
 `frontend/src/lib/amrResolution.ts` (`ResolutionKind`, `resolutionTextKeys`),
 `frontend/src/components/AmrGeneCell.tsx`, `frontend/src/lib/assemblySource.ts` (新規),
 `frontend/src/pages/SampleDetail.tsx`, `frontend/src/lib/htmlExport.ts`, locales
+
+### 70. 1 グループ = 1 施設・1 人 1 アカウント (共有アカウントにしない)
+**背景 (2026-10-02)**: 2 段階認証 (#62) は 1 アカウントに秘密鍵 1 つなので、施設内で
+アカウントを共有すると QR を全員で読み取るしかなく、同じ 30 秒のコードは 1 回しか
+通らない (`advance_totp_step`)。**データの共有単位はアカウントではなくグループ**
+(`group_id`) なので、同じ施設の人は同じグループに個人アカウントを作る運用にした。
+承認時に既存グループへ入れる機能 (`approve_account(target_group_id=)`) は元からあった。
+**入れたもの**:
+- **ワーカーの占有上限とフェアシェアをグループ単位で数える** (`_tenant_key` =
+  `job.group_id`、無ければ `account_id`)。アカウント単位のままだと
+  **メンバーの多い施設ほどワーカーを多く取れる** (cap 3 × 人数)。
+  環境変数名 `TAROT_ACCOUNT_WORKER_CAP` は互換のため据え置き。
+- **管理操作をログイン中のセッションに即時に効かせる** (`SessionInfo.revoked` +
+  `revoke_account_sessions`)。無効化・グループ移動・ロール変更・2 段階認証リセットで
+  失効させる。以前は無効化しても**最大 12 時間**そのまま使えた。SessionInfo は
+  消さない (実行中ジョブが token を参照する — #36.2)。`/api/auth/me` も revoked を 401 にする。
+  **値が変わらない「変更」では失効させない** (同じロール・同じグループ)。
+- 承認済みアカウントのグループ移動 (`POST /api/account-admin/accounts/{id}/group`,
+  `move_account_to_group`)。**データは動かさない** — ジョブと NAS の結果・DB は元の
+  グループに残り、移した人は移動先のデータを見るようになる。元のグループは所属者も
+  ジョブも無いときだけ消す (`_drop_group_if_unused_locked`、承認・却下と共通)。
+  **自分自身は移せない** (自分のセッションが失効して管理画面ごと締め出されるため)。
+- 管理画面: グループの選択肢に所属人数を出し、申請者と**同じ所属施設名**の利用者が
+  いるグループを候補として示す (NFKC・大小文字・空白の揺れだけ吸収)。
+  **自動では選ばない** — 所属を誤ると他施設のデータが見えるので決めるのは管理者。
+  申請フォームに「1 人 1 アカウントで申請」の案内を足した。
+**グループ内では誰でも他のメンバーのジョブを Cancel / 削除できる** (`owned_job` は
+グループで判定)。共有データなので意図どおり。
+**該当ファイル**: `api/services/snakemake_runner.py` (`_tenant_key`,
+`_running_samples_by_group`, `_occupied_workers_by_group`, `_try_dispatch`),
+`api/services/ssh_manager.py` (`revoked`, `revoke_account_sessions`),
+`api/routers/auth.py` (`require_session`, `/me`), `api/routers/account_admin.py`
+(`_revoke`, `set_group`), `api/services/account_store.py` (`move_account_to_group`,
+`_drop_group_if_unused_locked`), `api/tests/test_group_members.py` (新規),
+`frontend/src/components/AccountAdminPanel.tsx`, `frontend/src/pages/Login.tsx`,
+`frontend/src/lib/api.ts` (`moveAccountGroup`), locales
+
+### 71. パスキー (WebAuthn) — 2 段階目を認証アプリのコードの代わりに
+**方針 (2026-10-02)**: ログインは「パスワード → 2 段階目」のまま、2 段階目に
+**認証アプリのコード / パスキー / リカバリーコードのどれでも**使えるようにした。
+1 アカウントに複数登録できる (スマートフォン + PC)。パスワードを省く
+「パスキーだけのログイン」は採っていない (`residentKey=preferred` で作るので後から可能)。
+**設定**: `TAROT_PASSKEY_RP_ID` (公開ドメイン名) が空ならパスキーは無効。
+受け付けるオリジンは既定 `https://{RP_ID}`、別に要るときだけ `TAROT_PASSKEY_ORIGINS`。
+**オリジンを Host ヘッダーから推測しないこと** (比べる側の値を相手が送ってきた値で
+作るとフィッシング耐性が消える)。**IP アドレスで開いた画面ではパスキーは使えない**
+(WebAuthn の仕様) ので、画面は `passkeyUsableHere()` で出し分け、合わないときは
+「https://{RP_ID} で開いたときだけ使えます」と出して認証アプリに戻す。
+**依存**: `webauthn==2.8.0` (py_webauthn)。**3.x は cryptography>=49 を要求する**ので
+既存の固定 (48.0.0) に合わせて 2.8 系にした。入っていなくても起動はし、パスキーだけが
+無効になる (`passkeys.enabled()` が WARN を 1 回出す) — 本番更新で入れ忘れても
+ログインは止まらない。**本番に入れるときは `pip install -r api/requirements.txt`**。
+**守っていること**:
+- **初回登録をパスキーで済ませてもリカバリーコードは発行する**。
+  `verify_mfa` はリカバリーコードを `if secret:` の中でしか見ていなかったので、
+  認証アプリを持たないアカウントでは受け付けられなかった (直した)。
+- **「登録済み」の判定は認証アプリ OR パスキー** (`_start_mfa`)。どちらかがあれば初回登録にしない。
+- **管理者の「2 段階認証をリセット」はパスキーも消す**。認証アプリだけ消すと紛失した端末の
+  パスキーでそのまま入れてしまう。
+- **ログイン後の追加にはパスワードの再入力が要る** (盗まれたトークンから攻撃者のパスキーを
+  足されると、セッションが切れた後も入れてしまう)。**最後の 1 つ (認証アプリも無い場合) は
+  消させない** — 消すと次のログインがパスワードだけで新しい手段を登録できる状態になる。
+- **再入力の失敗は 403 で返すこと (401 にしない)**。`lib/api.ts` の `request()` は 401 を
+  「セッション切れ」としてログアウトさせるので、打ち間違いでログアウトされる (実機で踏んだ)。
+- チャレンジは 1 回きり (使ったら捨てる)。他人のパスキーで自分のアカウントには入れない
+  (credential の `account_id` を照合)。sign_count の巻き戻りは py_webauthn が弾く。
+- credential ID は base64url で **先頭が `-` になりうる** ので、削除はパスに載せず
+  本文で渡す (`InputValidationMiddleware` がパス要素を `NAME_RE` で縛っているため)。
+**検証の型**: `api/tests/test_passkeys.py` は**ソフトウェア認証器** (EC P-256 で attestation と
+署名を自作) で実際の py_webauthn の検証を通す。改ざん署名・別オリジン・チャレンジ再利用が
+落ちることも確かめている。画面は Vite + **検証専用の最小 API** (一時 DB・ワーカー無し・
+本番の `api.main` は起動しない) + **ページに注入した JS のソフトウェア認証器** で、
+登録 → リカバリーコード → 追加 → 削除 → パスキーでのログインを実ブラウザで通した。
+**ロケールを変えると Vite が全体リロードして注入した認証器が消える**ので、注入し直すこと。
+**共用 PC の注意**: Windows Hello に作ったパスキーはその Windows ユーザーに結びつくので、
+共用ログインの PC に作ると誰でも使える。画面で「共用 PC からは QR を自分のスマートフォンで
+読み取る」と案内している (クロスデバイス認証)。
+**該当ファイル**: `api/services/passkeys.py` (新規・設定と py_webauthn の薄い層),
+`api/routers/auth.py` (`/mfa/passkey/options`, `/mfa/passkey`, `_complete_mfa`,
+`_live_challenge`, リカバリーコードの扱い), `api/routers/passkeys.py` (新規・ログイン後の管理),
+`api/services/account_store.py` (`webauthn_credentials` テーブル, `reset_totp` がパスキーも消す,
+`passkey_count` / `totp_enabled`), `api/models/schemas.py`, `api/requirements.txt`,
+`deploy/tarot.env.example`, `api/tests/test_passkeys.py` (新規),
+`frontend/src/lib/webauthn.ts` (新規), `frontend/src/lib/auth.tsx` (`verifyPasskey`),
+`frontend/src/pages/Login.tsx`, `frontend/src/pages/AccountSecurity.tsx` (新規・`/account`),
+`frontend/src/App.tsx` (ヘッダーのユーザー名 → `/account`), locales
+
+### 72. 利用申請の通知 (管理者へのメール + 画面の件数表示)
+**方針 (2026-10-02)**: 申請 (status=pending) が来たら SMTP で管理者にメールし、
+画面ではヘッダーの Admin に承認待ち件数のバッジとタブのタイトル `(N)` を出す。
+標準ライブラリ (smtplib) だけで送る。設定は env (`deploy/tarot.env.example` の
+`TAROT_SMTP_*` / `TAROT_SIGNUP_NOTIFY_TO` / `TAROT_PUBLIC_URL`)。
+**設定の確認は本番と同じ env ファイルでコマンドを 1 本流す**:
+`python -X utf8 -m api.services.mailer --env-file <env> --to <自分のアドレス>`
+(失敗すると例外の種類とホスト:ポートを出す。パスワードは出さない)。
+- **最初の申請はすぐ送り、`TAROT_SIGNUP_NOTIFY_WINDOW_MINUTES` (既定 10 分) の間の申請は
+  1 通にまとめる** (ボットの連打でメールが飛び続けないように)。まとめ待ちはプロセス内だけ
+  なので API 再起動で消えるが、次のメールの「承認待ち 合計 N 件」と画面の件数で拾える。
+- **件名に利用者の入力を入れない** (件数だけ)。本文のユーザー名・所属施設は制御文字を落として
+  120 文字で切る。**メールアドレスと利用目的は載せない** (外部のメールボックスに残さない)。
+- **送信は申請の応答を待たせない** (`asyncio.to_thread`)。**失敗しても申請は受け付けたまま**で、
+  ログに `Signup notification failed` を残すだけ。
+- 画面の件数は `GET /api/account-admin/pending-count` (`require_admin` = admin + 院内 LAN)。
+  院外では 403 になるだけなので、画面は `role=admin` かつ `trusted_network` のときだけ問い合わせる
+  (60 秒ごと)。承認・却下したら即座に取り直す。
+- 起動時 (`api.serve`) に、送信先と SMTP の片方だけ設定されていると警告を出す。
+**検証の型**: テストは smtplib を差し替えて手順 (STARTTLS → 認証 → 送信) とまとめ送信を確かめる。
+加えて手元で `smtpd` のローカル受信サーバーに実際に送り、日本語の件名が正しく届くことを確認した。
+**該当ファイル**: `api/services/mailer.py` (新規・CLI つき), `api/services/signup_notify.py` (新規),
+`api/routers/auth.py` (`_signup_notifier`, signup から呼ぶ), `api/routers/account_admin.py`
+(`/pending-count`), `api/serve.py` (`_check_env`), `api/tests/test_signup_notify.py` (新規),
+`deploy/tarot.env.example`, `frontend/src/App.tsx` (バッジ・タイトル), `frontend/src/App.css`
+(`.nav-badge`), `frontend/src/components/AccountAdminPanel.tsx`, `frontend/src/lib/api.ts`, locales
