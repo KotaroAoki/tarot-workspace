@@ -4609,6 +4609,12 @@ long-read 検体には当てていない (#59 の環状接合部の backfill は
   院外では 403 になるだけなので、画面は `role=admin` かつ `trusted_network` のときだけ問い合わせる
   (60 秒ごと)。承認・却下したら即座に取り直す。
 - 起動時 (`api.serve`) に、送信先と SMTP の片方だけ設定されていると警告を出す。
+**`smtplib.SMTP.login()` を使わないこと** (実測 2026-10-02, TAROT-ORCH)。方式を順に試して
+**最後のエラーだけ**を上げるので、Gmail が AUTH PLAIN で 535 (パスワード不一致) を返した後に
+AUTH LOGIN を試して切断されると、パスワードの誤りが `Connection unexpectedly closed` に化ける。
+接続・STARTTLS・証明書 (Google Trust Services) まで正常だったので通信の遮断を疑って遠回りした。
+`_login()` は PLAIN があれば PLAIN だけで認証する。**切り分けは架空のアカウントでわざと失敗させる**
+と早い (535 が返れば経路は素通し)。
 **検証の型**: テストは smtplib を差し替えて手順 (STARTTLS → 認証 → 送信) とまとめ送信を確かめる。
 加えて手元で `smtpd` のローカル受信サーバーに実際に送り、日本語の件名が正しく届くことを確認した。
 **該当ファイル**: `api/services/mailer.py` (新規・CLI つき), `api/services/signup_notify.py` (新規),
