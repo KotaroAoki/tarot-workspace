@@ -4674,3 +4674,47 @@ AUTH LOGIN を試して切断されると、パスワードの誤りが `Connect
 (`/pending-count`), `api/serve.py` (`_check_env`), `api/tests/test_signup_notify.py` (新規),
 `deploy/tarot.env.example`, `frontend/src/App.tsx` (バッジ・タイトル), `frontend/src/App.css`
 (`.nav-badge`), `frontend/src/components/AccountAdminPanel.tsx`, `frontend/src/lib/api.ts`, locales
+
+### 73. 利用申請を「新しい施設」と「招待で参加」に分け、連絡先メールの確認を必須にした
+**方針 (2026-10-02, ユーザー決定)**: グループの取り違え (同じ施設の人が別グループに入る /
+別施設のグループに入る) を起こさないため、**グループを申請者にも管理者にも選ばせない**。
+- **新しい施設** (`request_kind=new_group`): 専用グループを作る。グループの表示名は所属施設名
+  (日本語だけの施設名は slug にならないので ID はユーザー名から作る)。
+- **招待で参加** (`join`): 既存メンバーがアカウント設定から相手のアドレスに招待を送る。
+  招待コードで申請すると**そのグループに固定**され、管理者の承認画面でもグループは変えられない
+  (API も 400)。管理者は本人確認だけをする。承認するのはシステム管理者 (ユーザー決定)。
+- **連絡先メールは必須で、6 桁の確認コードで確認する**。申請は確認が済んでから登録する
+  (`POST /api/auth/signup` → `/signup/verify`)。**既存アカウントは次回ログイン時に登録必須**
+  (`/api/auth/me` の `email_verification_required` を画面が見て、他の画面の代わりに登録画面を出す)。
+- **承認したら本人にメールで知らせる**。結果 (sent / failed / skipped) を管理画面に出す —
+  送れなくても承認は取り消さない (管理者が別の手段で連絡できるように)。却下は知らせない。
+**守っていること**:
+- **招待はアドレスに結びつける** (申請時に招待先と同じアドレスを要求し、そのアドレスに確認コードを
+  送る) = 招待コードだけを拾った第三者は使えない。招待コードは約 79 ビット・7 日・1 回きりで、
+  DB には SHA-256 だけを持つ。消費はアカウント作成と同じトランザクション (同時に 2 人は使えない)。
+  `GET /api/auth/invitation` はグループ名だけを返し、**宛先は返さない**。
+- 自分のアドレスを確認していない人は招待できない。既にアカウントのあるアドレスには招待しない。
+  **送れなかった招待は取り消し済みにする** (届いていない招待を残さない)。招待は 1 日 20 件まで。
+- **1 アドレス 1 アカウント** (`email_in_use`、大小文字と前後の空白を吸収して比較)。
+- 確認コードはプロセス内だけ (15 分・5 回・再送は 60 秒あけて 3 回まで)。コードは SHA-256 で照合。
+  ログイン後の確認コードの送信は `login_throttle` と**別の**制限 (`_send_throttle`) で数える —
+  混ぜるとコードの連打でログインまで締め出す。
+- **メールを送れないサーバーでは確認を求めない** (求めると誰もログイン後に進めない)。ただし
+  公開モードでは確認なしの申請を受け付けない (503)。
+- 管理者への申請通知 (#72) に種類 (「新しい施設」/「参加申請 (グループ…)」) を載せる。
+- 申請画面の既定は「招待で参加」タブ。新しい施設は明示的に選ばせる (取り違えを減らすため)。
+- 古い申請 (列追加前) は `request_kind` が NULL = `new_group` として扱う。
+**検証の型**: `api/tests/test_signup_invitations.py` は `mailer.send_mail` を受信箱に差し替え、
+本文から確認コードと招待コードを取り出して実際の手順をなぞる。画面は検証専用の最小 API
+(メールをファイルに書く) で、招待 → 招待リンクからの申請 (別アドレスは拒否) → 確認コード →
+管理者のメール登録画面 → 承認 → 承認メールまでを実ブラウザで通した。
+**該当ファイル**: `api/services/email_codes.py` (新規), `api/services/account_mail.py` (新規・文面),
+`api/routers/account_self.py` (新規・メール登録と招待), `api/routers/auth.py` (signup 2 段階,
+`/invitation`, `/me` の email 状態), `api/routers/account_admin.py` (参加申請のグループ固定・承認メール),
+`api/services/account_store.py` (`invitations`, `create_join_request`, `set_verified_email`,
+`email_in_use`, 列 `email_verified_at` / `request_kind` / `invited_by`),
+`api/services/signup_notify.py`, `api/models/schemas.py`, `api/tests/test_signup_invitations.py` (新規),
+`frontend/src/pages/Login.tsx` (申請の種類・招待コード・確認コード),
+`frontend/src/components/EmailVerifyForm.tsx` / `EmailVerifyGate.tsx` (新規),
+`frontend/src/pages/AccountSecurity.tsx` (メールと招待の欄), `frontend/src/components/AccountAdminPanel.tsx`,
+`frontend/src/App.tsx`, `frontend/src/lib/auth.tsx`, `frontend/src/lib/api.ts`, locales
