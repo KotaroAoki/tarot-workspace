@@ -2580,6 +2580,59 @@ zoomLayer の外に置いてズームのたびに引き直す (中に入れる�
 (`describeContigFrames`), `frontend/src/components/PlasmidStructureCompare.tsx` /
 `PlasmidStructureChain.tsx`, `frontend/src/lib/api.ts`, locales
 
+### 42.7 プラスミドの登録単位は MOB のクラスタではなく「分子」 — 閉じた環を分け、対象外 contig を書かない
+**発端 (2026-10-02)**: #42.6 の AB369 で「環状と線状が 1 本で描かれる」理由を追ったら、
+表示ではなく**登録の単位**が壊れていた。原因は 2 つ。
+1. **MOB-recon のクラスタは分子ではない。** contig を「どの参照プラスミドに似ているか」で
+   振り分けるだけで、アセンブリ上のつながりは見ない。AB369 の線状 contig (被覆 32×) と
+   閉じた環状 33 kb (96×) は GFA 上で別の連結成分 = 別の分子。AA893 は閉じた環 2 本
+   (5.2 kb + 6.2 kb) が 1 単位。
+2. **登録処理は対象外と判定した contig まで FASTA に入れていた。** `require_circular`
+   (#37.1) で線状 contig を `contig_ids` から外していたのに、FASTA は MOB の
+   `plasmid_{cid}.fasta` を**丸ごと複製**していた (`register_plasmids_to_db.py` と
+   `collect_plasmid_fastas.py` の両方)。**pling は FASTA の 1 本目しか見ない**ので、
+   AB369 の DCJ 距離は 27 本すべてが**対象外のはずの線状 contig から計算**され、
+   33 kb の環は一度も比べられていなかった。
+**解決**: 単位の決め方を `workflow/scripts/plasmid_units.py` に集約 (#19)。
+- **閉じた環状 contig は 1 本ずつ別単位** (環状閉環 = 1 分子として完結)。非環状は
+  まとめて 1 単位 (= 断片化アセンブリは従来どおり。`require_circular=true` では
+  そもそも登録されない)。
+- 名前: いちばん大きい単位が従来の `{sample}__{cluster}` を引き継ぎ、残りは
+  `{sample}__{cluster}.{contig}` (例 `VRE15__AA893.contig_5`)。MOB クラスタ ID は英数字
+  だけなので**最初の `.` で切ればクラスタに戻る** (`cluster_of_uid`)。uid から
+  クラスタを取る箇所は全部これに揃えた (構造比較の `split_uid` / API の
+  `_uid_cluster` / 画面の `splitUnitUid`)。構造比較スクリプトはワーカーへ単体で
+  送るので写しを持つ — テストで正本と一致させてある。
+- **単位の contig だけを書く**。揃わなければ書かない (半分のプラスミドを登録しない)。
+  大きさと contig 数は書いた配列から取る。分けた単位の rep / relaxase / 可動性は
+  MOB-typer のクラスタ値 (= 別の分子を含んだ判定) を使わず contig_report の値から
+  組み直す (`typing_scope`)。**MOB-recon は contig 単位の可動性を出さない**
+  (`predicted_mobility` が `-`) ので MOB-typer の定義で組み立てる。
+- 同じ検体の別単位を照会の「他検体との一致」に数えない (`check_plasmid_outbreak`)。
+- 画面は分けたかどうかを**判定し直さない** — クラスタ / 照会データに分割 uid がある
+  contig だけを別行にする。
+**ユーザー決定**: 非環状 contig は**既存の規則どおり外す** (登録・クラスタリング対象外。
+照会のみ。`registration.json` の `withheld_contigs` に残す)。帰結として AB369 の線状
+111 kb は検体間で比べられず、kaoki_stec TAS050_ONT は閉じていない 90 kb の本体が外れて
+**2 kb の環だけが AA345 として残る**。
+**既存 DB = `backfill_plasmid_units.py`** (dry-run 既定)。判定も書き込みも写さず、
+**差がある検体だけ本物の `register_plasmids_to_db.main()` を回す** (#46.2 と同じ考え方)。
+dry-run も同じ `plan_units()` を使う。**退避だけが出る検体は触らない** — 環状限定の
+規則より前に入った線状 contig の旧登録で今回と無関係 (再解析で退避される)。
+mash の .msh を作るので mob_suite_env のあるワーカー (honban) で回した。
+2026-10-02 適用: harada_ndm 6 / kaoki_stec 5 / tmuh 34 / toho_micro_id 14 /
+toho_micro_id_bsi 5 / toho_omori 1 検体 (差し替え 88 / 新規 38)。退避は各 DB の
+`_backup/<ts>_plasmid_units/` (index.tsv・by_cluster・registration.json)。
+**適用後はグループごとにプラスミド関連性 (クラスタリング) を再実行すること** —
+pling が新しい単位で距離を計算し直すのはそこ (#42.1)。
+**該当ファイル**: `workflow/scripts/plasmid_units.py` (新規・単一の真実源),
+`workflow/scripts/register_plasmids_to_db.py` (`plan_units`, 単位ごとの登録,
+`withheld_contigs`), `workflow/scripts/collect_plasmid_fastas.py`,
+`workflow/scripts/check_plasmid_outbreak.py`, `workflow/scripts/compare_plasmid_structure.py`
+(`split_uid`, `is_split_unit_uid`), `workflow/scripts/backfill_plasmid_units.py` (新規),
+`workflow/tests/test_plasmid_units.py` (新規), `api/services/result_parser.py`
+(`_uid_cluster`), `frontend/src/lib/plasmidMap.ts` (`splitUnitUid`)
+
 ### 46.3 インテグロンを Genome Map カードへ統合 (overview + detail)
 2026-09-02。独立カードだった「クラス 1 インテグロン」を Genome Map カードに
 畳んだ。**尺度が 10〜1000 倍違うのが本質**なので、素直に並べるのではなく
