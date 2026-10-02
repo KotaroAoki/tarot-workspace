@@ -4414,3 +4414,70 @@ Excel で日本語の列名が化けないよう UTF-8 BOM を付ける (取り�
 `frontend/src/pages/SampleDetail.tsx`, `frontend/src/lib/sampleBrief.ts`,
 `frontend/src/components/SampleBriefView.tsx`, `frontend/src/lib/serverText.ts`
 (`specimenCategoryLabel`), `frontend/src/lib/api.ts`, `frontend/src/lib/locales/{ja,en}.ts`
+
+### 69. 短鎖リードで contig 端に切れた遺伝子は、SPAdes のグラフに沿って延ばせば確定できることが多い
+**発端 (2026-10-02, vitek2/11459)**: Illumina 検体の blaCTX-M がアレル未確定
+(BLASTX / 被覆 96.56% / NODE_7 の末端ぴったり)。デプス不足を疑ったが、
+**リード被覆は 43.7x あり、原因はデプスではなかった**。`assembly_graph.gfa.gz` には
+blaCTX-M-15 の全 876 bp が 100% 一致で入っており (区間 446167 = 遺伝子 31–876、
+446169 = 1–157、重なり 127)、NODE_7 は遺伝子の手前の**分岐点で止まっていた**だけ
+(446169 に入口が 2 本ある)。NODE_7 側から見ると先は 1 本なので、延ばせば一意に繋がる。
+→ **追加シーケンスでは直らない**。SAUTE のような別アセンブラも要らない。
+
+**実装 = 環状接合部の救済 (#59) の 2 本目の手段として同じスクリプトに足した。**
+`resolve_split_genes.py` が ① circular_junction → ② assembly_graph の順に試し、
+結果は同じ `split_gene_resolution.json` に `resolution` で区別して入る。パーサ・
+backfill・画面の経路はすべて共用 (画面は「グラフ延長」バッジ)。グラフ処理は
+`graph_extension.py`。**配列も座標も書き換えない / アリル名は AMRFinderPlus が決める**
+のは #59 と同じ。
+- **端点の対応付け**: SPAdes の contig はエッジの連結なので、contig 末尾と
+  **エッジ全体が一致する向き付き区間**がちょうど 1 つある ((k+1)-mer は 1 本の
+  エッジにしか属さない)。実測 11459 で 658 端中 656 端が一意に取れた。P 行
+  (scaffold の経路) は contigs.fasta と番号が一致する保証が無いので使わない。
+- **経路を全部列挙し、答えが割れたら確定しない。** contig が止まった理由そのものが
+  分岐なので、ここを緩めると別コピーの配列を継ぎ足した遺伝子を報告することになる。
+  採る条件: 全長になった経路が**名前も一致率も**全部同じ、かつ「十分延びたのに
+  全長にならない経路」が無い。延長量は「見えていない部分 + 300 bp」で、それより
+  先で分かれる経路は見せる配列が同じなのでまとめて扱う。
+- **候補は Method ではなく「端に接している + 被覆 100% 未満」で拾う。**
+  AMRFinderPlus は端で切れていても `PARTIAL_CONTIG_END` と付けないことがある
+  (11459 の blaCTX-M は BLASTX)。
+- **延長後のヒットは「元と同じ種類の要素」だけを候補にする** (`same_element_family`)。
+  範囲の重なりだけで選ぶと、実測 kaoki_stec で `stxA2` の行が `stx2c_operon` に、
+  `stx2_operon` の行が `stxA2` に置き換わった。元の名前の前方一致 + オペロン同士。
+  そのうえで元の断片と範囲がいちばん近いもの (区間の Jaccard) を採る。
+- 理由は書き分ける: `graph_dead_end` (グラフ上も先が無い = 本当にデータが途切れている。
+  ここはデプスや SAUTE が効く側) / `graph_ambiguous_paths` / `graph_too_many_paths`
+  (32 経路超) / `graph_truncated_at_both_ends` / `no_assembly_graph` (long-read)。
+- **Flye は対象外。** contig は研磨後の配列でエッジと一致しない。GFA は params 渡し
+  (input にすると long-read 検体で DAG が壊れる)。
+
+**実データでの dry-run (2026-10-02, 短鎖 376 検体, honban で本物の AMRFinderPlus)**:
+グラフ延長で全長化 **146 遺伝子 / 115 検体** (EXACTX 77 / BLASTX 53 / ALLELEX 16)、
+うち確定アリルに変わったもの 16 (blaTEM → TEM-1 ×5 / TEM-256、blaCTX-M → CTX-M-15 ×3 /
+CTX-M-2、qacE → qacEdelta1 ×6)。所要は約 1 秒/検体。
+**検証**: kaoki_stec は同じ株を ONT でも読んでいるので、延長で得た遺伝子が ONT 側の
+アセンブリにあるかを突き合わせた → **84 / 84 件で一致**。
+- **注意: kaoki_stec の TAS041 / TAS125 は延長前から Illumina = Stx2c、ONT = Stx2a**
+  (B サブユニットが前者は Stx2c、後者は Stx2a に EXACTX、VirulenceFinder も同じ)。
+  延長が持ち込んだ食い違いではない。ペアの素性 (別コロニー / ファージの得失) は未確認。
+- 確定できずに残る主な理由: `graph_too_many_paths` 183 (tccP 94 / stx2_operon 63 =
+  反復配列を持つ遺伝子) / `graph_ambiguous_paths` 172 / `graph_dead_end` 127。
+  `graph_dead_end` は SAUTE (リードから組み直す) で救える可能性がある側。
+
+**既存検体**: `backfill_split_gene_resolution.py` がそのまま両方の手段を当てる
+(`--only-unresolved` で候補のある検体だけ、`--no-graph` でグラフ延長を外す)。
+**同席で直したもの**: QC カード (画面と HTML 出力) の contig 一覧が入力モードによらず
+「Contig Coverage (Flye)」だった。`lib/assemblySource.ts` で判定し、短鎖は
+「(SPAdes)」+ 被覆列を **k-mer 被覆**と明示して ≥40× の色分けを外した
+(k-mer 被覆は read 被覆の 0.3〜0.6 倍 — #37)。Coverage flow も
+「Sequenced (fastp 推定被覆) → SPAdes (k-mer)」にした。
+**該当ファイル**: `workflow/scripts/graph_extension.py` (新規),
+`workflow/scripts/resolve_split_genes.py` (`resolve_circular` / `resolve_graph` /
+`is_graph_candidate` / `same_element_family`), `workflow/tests/test_graph_extension.py` (新規),
+`workflow/rules/stage1_amrfinder.smk` (`--gfa`, `--skip-circular`),
+`workflow/scripts/parse_amrfinder.py` / `backfill_split_gene_resolution.py` (`graph` の状態),
+`config/config.yaml` / `config.multiserver.yaml` の `amrfinder.resolve_graph_extensions`,
+`frontend/src/lib/amrResolution.ts` (`ResolutionKind`, `resolutionTextKeys`),
+`frontend/src/components/AmrGeneCell.tsx`, `frontend/src/lib/assemblySource.ts` (新規),
+`frontend/src/pages/SampleDetail.tsx`, `frontend/src/lib/htmlExport.ts`, locales
