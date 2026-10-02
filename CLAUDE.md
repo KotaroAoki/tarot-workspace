@@ -4020,7 +4020,9 @@ plasmid DB 側は `num_registered=7 / num_refreshed=6` で #42.5 の更新経路
   `config_overrides` も `--config key=value` でそのままシェルへ渡っていたので、利用者が指定
   できるキーは `samples` だけ (`USER_CONFIG_OVERRIDE_KEYS`)。
 - **`role` 列は以前どこでも使われていなかった。** 今は admin = 承認・config・DB パス切替の権限。
-  LAN 外からのログインでは admin を持ち込ませない (`_effective_role`)。
+  **LAN 外からの管理者アカウントのログインは 403 で拒否する** (パスワード照合の後・MFA の前)。
+  当初は `_effective_role` で一般利用者に格下げして通しており、公開後の確認 (2026-10-02) で
+  スマートフォン回線から「管理者で入れてしまった」ように見えた。格下げは多重防御として残す。
 
 **信頼ネットワークの判定の罠**: 送信元はリバースプロキシの `X-Forwarded-For` から uvicorn が
 復元した IP。**プロキシが実 IP を渡さないと全員が 127.0.0.1 = LAN に見える**ので、公開モードでは
