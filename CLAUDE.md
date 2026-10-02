@@ -4403,7 +4403,16 @@ Shift_JIS と見て化ける)、**TSV は UTF-16LE + BOM**。UTF-8 + BOM の TSV
 再現)。UTF-16LE + BOM は Excel 自身の「Unicode テキスト」と同じ形で、列が分かれ日本語も
 化けない。**確認は Excel の実物で行うこと** — `osascript` で Excel に開かせて
 `value of range "A1:G1"` を読めば、画面を見ずにセルの分かれ方を機械的に確かめられる。
-取り込みは貼り付けた文字列を読むので、ファイルの文字コードには依存しない。
+**入力済みの CSV / TSV はドラッグ＆ドロップ (または「ファイルを選択」) でも受ける。**
+読み込みはブラウザ内で、文字コードは `lib/tableFileDecode.ts` が判定する
+(BOM → UTF-8 として厳密に読めるか → 読めなければ Shift_JIS)。
+**日本語の Excel の「CSV」は Shift_JIS・BOM なし** (Excel for Mac で保存させて実測)、
+「CSV UTF-8」は UTF-8 + BOM、「Unicode テキスト」は UTF-16LE + BOM で、どれも読める。
+Shift_JIS は推定なので、読み込んだときに「Shift_JIS と判断」と出し、化けていたら
+「CSV UTF-8」で保存し直すよう添える。Excel ブック (.xlsx / .xls) は**先頭のバイトで**
+見分けて理由付きで断る (中身を推測で取り出さない)。読み込んだら確認 (dry-run) まで自動で
+進め、書き込みは従来どおり「取り込む」を押したときだけ。枠の外にドロップしても
+ブラウザがファイルを開いて画面を離れないよう、背景でも既定動作を止めている。
 
 **A4 レポート**: 材料と患者 ID は**登録があるときだけ**見出しに出す (分離日・施設のように
 未登録を「—」で常設しない)。見出しが 1 行増えうるが、登録済みの検体で
@@ -4416,6 +4425,7 @@ Shift_JIS と見て化ける)、**TSV は UTF-16LE + BOM**。UTF-8 + BOM の TSV
 `set_sample_metadata`, `import_sample_metadata`), `api/tests/test_specimen.py` (新規),
 `api/tests/test_sample_metadata_store.py` (新規), `api/tests/test_sample_metadata_import.py`,
 `frontend/src/components/SampleMetadataImportDialog.tsx`,
+`frontend/src/lib/tableFileDecode.ts` (ドロップしたファイルの文字コード判定),
 `frontend/src/components/SampleMetadataDialog.tsx`, `frontend/src/pages/Results.tsx`,
 `frontend/src/pages/SampleDetail.tsx`, `frontend/src/lib/sampleBrief.ts`,
 `frontend/src/components/SampleBriefView.tsx`, `frontend/src/lib/serverText.ts`
