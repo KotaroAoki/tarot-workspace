@@ -2546,6 +2546,40 @@ toho_omori 26410 の 2 本は #19 で染色体と確定したもの。**いず�
 `workflow/scripts/backfill_plasmid_db_refresh.py` (新規),
 `workflow/tests/test_plasmid_db_refresh.py` (新規)
 
+### 42.6 多 contig プラスミドは contig ごとに向きを合わせる (E. faecium の線状 contig)
+**症状 (2026-10-02, tmuh VRE15 の AB369 を「連鎖」で表示)**: DCJ 0 のペアなのに
+リボンが全面的に交差し (オレンジ = 逆向き)、開始点が揃っていないように見えた。
+**原因**: AB369 は **27 本すべてが「線状 contig 101〜155 kb + 環状 contig 33,353 bp」の
+2 contig 構成** (環状側は dnaapler で repA 起点に回転済み)。`estimate_frame` は
+多 contig だと `multi_contig` で**何もしなかった**ため、線状 contig の鎖が検体ごとに
+ばらばらのまま描かれていた (実測 VRE06 × VRE07 共線性 0.23)。
+**解決**: `_estimate_per_contig_frame` — contig ごとに単一 contig の `estimate_frame` を
+そのまま呼び (環状は向き+原点、非環状は向きだけ)、結果を `per_contig` に
+連結軸上の区間付きで持つ。適用側 (`apply_frame_to_hsp` / `_interval` / `_feature`) は
+区間を見て該当 contig の内側だけで変換する。**contig の並び順は変えない**
+(contig 境界・遺伝子・pling ブロックの位置関係を崩さないため)。鎖の
+`reference_frame` も同じ枠をそのまま受ける。`LOGIC_VERSION` 5。
+効果 (実データ): 画面と同じ鎖 VRE15→01→03→06→07→09→21→39 の全リンクで
+共線性 1.0・骨格の逆鎖 0 bp。反転した検体でも遺伝子座標が上下のリンクで一致する。
+**枠では消えない残り — 線状 contig の端の自己逆相補 (折り返し) 領域**:
+27 本中 17 本で線状 contig の片端 17〜124 kb が**自分自身の逆相補**になっている
+(self-blastn で `1..N` が `N..1` に一致)。線状 contig の長さのばらつき
+(101〜155 kb) と、灰色の交差リボン (`repeat` の逆鎖) の大半はこれ。配列の性質なので
+描画の枠では揃わない。線状プラスミドの末端 (ヘアピン/TIR) をリードが折り返して
+読んだアセンブリ由来の可能性があるが未確認。**配列は書き換えていない。**
+**環状/線状の表示**: 全ての構造比較図 (ペア・連鎖・段組の行/シンテニー) で、
+バーの各 contig 区間の左端に「↻ 環状 / ↔ 線状 / ? 環状か不明」の札を出す。
+円環モードは凡例、ペア表示は見出しに要約 (`線状 112.9 kb + 環状 33.4 kb`)。
+判定と描画は `lib/plasmidTopology.ts` だけが持つ (図ごとに複製しない)。
+**`circular: null` は「不明」であって「線状」ではない** (#42.2)。ペア表示の札は
+zoomLayer の外に置いてズームのたびに引き直す (中に入れると文字が横に伸びる)。
+**該当ファイル**: `workflow/scripts/compare_plasmid_structure.py`
+(`_estimate_per_contig_frame`, `_contig_windows`, `_frame_piece`, apply 系),
+`frontend/src/lib/plasmidTopology.ts` (新規),
+`workflow/tests/test_compare_plasmid_structure.py`, `frontend/src/lib/plasmidStructureUi.ts`
+(`describeContigFrames`), `frontend/src/components/PlasmidStructureCompare.tsx` /
+`PlasmidStructureChain.tsx`, `frontend/src/lib/api.ts`, locales
+
 ### 46.3 インテグロンを Genome Map カードへ統合 (overview + detail)
 2026-09-02。独立カードだった「クラス 1 インテグロン」を Genome Map カードに
 畳んだ。**尺度が 10〜1000 倍違うのが本質**なので、素直に並べるのではなく
