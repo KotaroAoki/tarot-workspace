@@ -4466,7 +4466,11 @@ CTX-M-2、qacE → qacEdelta1 ×6)。所要は約 1 秒/検体。
   `graph_dead_end` は SAUTE (リードから組み直す) で救える可能性がある側。
 
 **既存検体**: `backfill_split_gene_resolution.py` がそのまま両方の手段を当てる
-(`--only-unresolved` で候補のある検体だけ、`--no-graph` でグラフ延長を外す)。
+(`--only-unresolved` で候補のある検体だけ、`--input-modes short_read,hybrid` で短鎖だけ、
+`--no-graph` でグラフ延長を外す)。**2026-10-02 に NAS 全アカウントの短鎖検体へ適用済み**:
+376 検体に `split_gene_resolution.json` を書き、163 遺伝子 (グラフ延長 146 + 環状接合部 17) に
+resolved_* を付けた (kaoki_stec 84 / vitek2 41 / toho_omori 24 / proteus 14、エラー 0)。
+long-read 検体には当てていない (#59 の環状接合部の backfill は long-read 側が未適用のまま)。
 **同席で直したもの**: QC カード (画面と HTML 出力) の contig 一覧が入力モードによらず
 「Contig Coverage (Flye)」だった。`lib/assemblySource.ts` で判定し、短鎖は
 「(SPAdes)」+ 被覆列を **k-mer 被覆**と明示して ≥40× の色分けを外した
