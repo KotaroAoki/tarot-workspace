@@ -4854,6 +4854,11 @@ WSL・Windows の再起動 (単発)。**未解決のイベントは DB に残り
 (一時 DB・ディスパッチャー無し・本物の WorkerMonitor で読み取り専用の probe だけ実機に流し、スケジューラーと
 7 日分の履歴は合成) を Vite につないで確認した。lint の `react-hooks/purity` は描画中の `Date.now()` を
 弾くので、経過時間の基準はサーバーの応答時刻 (`generated_at`) にする。
+**ワーカー名の変更は表示名だけ (2026-10-03, honban → 表示名 FJIRA)**。ID (`honban`) はジョブの
+`sample_worker`・`worker_metrics.db`・接続プールが引くキーなので変えない。変更は TAROT-ORCH で
+`tools/manage_accounts.py --env-file ... rename-worker honban FJIRA` (API 再起動不要)。
+ジョブ一覧/詳細・Dorado の応答は `worker_names` ({ID: 表示名}) を返し、画面はそれで表示する
+(以前は Dashboard / JobDetail / DoradoJobDetail が内部 ID をそのまま出していた)。
 **該当ファイル**: `api/services/worker_probe_remote.py` / `worker_monitor.py` / `worker_metrics_store.py` /
 `worker_alerts.py` (新規), `api/routers/workers.py` (新規), `api/main.py` (`_build_worker_monitor`),
 `api/services/snakemake_runner.py` (`_track_activity`, `worker_usage_snapshot`, `sample_started_at`),
