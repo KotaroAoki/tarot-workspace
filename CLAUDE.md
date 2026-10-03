@@ -4805,3 +4805,54 @@ AUTH LOGIN を試して切断されると、パスワードの誤りが `Connect
 `frontend/src/components/EmailVerifyForm.tsx` / `EmailVerifyGate.tsx` (新規),
 `frontend/src/pages/AccountSecurity.tsx` (メールと招待の欄), `frontend/src/components/AccountAdminPanel.tsx`,
 `frontend/src/App.tsx`, `frontend/src/lib/auth.tsx`, `frontend/src/lib/api.ts`, locales
+
+### 74. ワーカー監視ダッシュボード (管理者向け + 利用者向け)
+**目的 (2026-10-03)**: 3 台のワーカーの稼働状況と空き具合を、管理者向け (`/admin/workers`) と
+利用者向け (Dashboard / New Job の「サーバーの混み具合」) の 2 通りで出す。計画と決定事項は
+`PLAN_worker_monitoring_dashboard.md`。過去の障害 (WSL のアイドル停止 / forwarder の受け付け停止 /
+Windows Update の再起動 / ホスト C: 満杯で read-only / NAS 帯域の飽和) は、どれも見えないまま進行していた。
+**仕組み**: API 内の常駐タスク `WorkerMonitor` が 60 秒ごとに各ワーカーへ SSH 1 チャネルで
+`api/services/worker_probe_remote.py` を **stdin で** 流す (標準ライブラリのみ・Python 3.8 互換。
+実測 honban 3.8.10 / kibanb・tugrip 3.14.4)。3 台並列で 1 周期 1.3〜2.0 秒。
+Windows 側 (起動時刻・C:) は `powershell.exe` 経由で 5 周期に 1 回 (0.5 秒)。
+- **画面の表示は SSH を起こさない。** 両方の API は集めた値を返すだけ。利用者向けは院外にも公開しているので、
+  ページの読み込みが SSH を起こすと負荷をかける手段になる。
+- **監視の結果はスケジューラーの判定に使わない** (監視の不具合を新しい失敗経路にしない)。
+  `_unhealthy_workers` は従来どおりスケジューラーが管理し、画面に並べて出すだけ。
+- 接続できなければ 1 回だけ試して `unreachable` (実測 10 秒)。監視側から再接続を繰り返さない (#67)。
+- **probe は何も書かない** (read-only の検出も `/proc/mounts`)。取れなかった値は null (#28)。
+**probe で分かったこと (2026-10-03 実測)**:
+- GPU は honban RTX 4090 (24 GB)、kibanb・tugrip RTX 5090 (32 GB)、いずれも 1 枚。
+- **ホスト C: は `/mnt/c` の statvfs で測れる** (9p。Windows で取った C: の値と一致)。WSL 内の `df /` では分からない。
+- honban の NAS は `/proc/mounts` に autofs と cifs の 2 行が出る。**後から載った方 (cifs) を採ること。**
+- プロセスは**実行ファイル名** (python/perl/java のときはスクリプト名) で分類する。cmdline の部分一致だと
+  ルールのシェル `bash -c '... flye ...'` まで flye として数える。
+**スケジューラーの枠に数えられない実行がある。** `_worker_load` には on-demand の cgSNP・Bakta・
+プラスミド関連性・Dorado が入らない。`_worker_load` だけで「空き」と出すと、4 時間かかる系統樹を計算中の
+ワーカーを空いていると表示する。`SnakemakeRunner._track_activity` (台帳) を
+`_run_core_snp_batch` / `_run_bakta_worker_chunk` の外側に巻き (本体は `*_inner`)、プラスミド関連性は
+`_plasmid_cluster_runs` から拾う。読み出しは `worker_usage_snapshot()` (SSH 不要)。
+cgSNP はログイン中のセッションの接続先で走るので、ワーカーは host:port で引く (`_worker_id_for_session`)。
+Dorado は 1 ジョブが全ワーカーにまたがるので、GPU が動いているかは probe (dorado プロセス / GPU 使用率) で見る。
+**履歴と通知**: `worker_metrics.db` はアカウント DB と**別ファイル** (毎分の書き込みでロック競合させない)。
+1 分値を 7 日、状態変化 (`worker_events`) を 90 日。判定は `worker_alerts.evaluate` (純関数) — 不通 5 分 /
+read-only / ホスト C: 30 GB / 作業ディスク 50 GB (復帰は +10 GB のヒステリシス) / NAS・GPU は 3 回連続 /
+WSL・Windows の再起動 (単発)。**未解決のイベントは DB に残り、API を再起動しても同じメールを送り直さない**
+(再起動前の uptime・Windows の起動時刻も DB から引き継ぐので、再起動をまたいでも再起動を検出できる)。
+無効化したワーカーは通知しない。メールは #72 の mailer で、最初はすぐ・10 分以内はまとめて 1 通。
+本文にグループ名・検体名を入れない。閾値は API (`thresholds`) で画面にも渡し、画面に書き写さない。
+**利用者向けの応答に入れないもの**: ホスト名・IP・パス、他グループの名前・検体名・ジョブ ID、CPU・メモリの値。
+自分のグループの件数だけは返す。テスト (`test_availability_does_not_leak_other_groups_or_hosts`) で縛ってある。
+状態は free / partial / full / offline (不通・確認途絶・接続失敗のクールダウン) / maintenance (無効) / unknown
+(初回の確認前 — 「空き」と出さない)。
+**画面の確認方法**: 本番の `api.main` を Mac で起動すると二重ディスパッチになるので、**検証専用の最小 API**
+(一時 DB・ディスパッチャー無し・本物の WorkerMonitor で読み取り専用の probe だけ実機に流し、スケジューラーと
+7 日分の履歴は合成) を Vite につないで確認した。lint の `react-hooks/purity` は描画中の `Date.now()` を
+弾くので、経過時間の基準はサーバーの応答時刻 (`generated_at`) にする。
+**該当ファイル**: `api/services/worker_probe_remote.py` / `worker_monitor.py` / `worker_metrics_store.py` /
+`worker_alerts.py` (新規), `api/routers/workers.py` (新規), `api/main.py` (`_build_worker_monitor`),
+`api/services/snakemake_runner.py` (`_track_activity`, `worker_usage_snapshot`, `sample_started_at`),
+`api/services/dorado_runner.py` (`usage_snapshot`), `api/tests/test_worker_monitor.py` + fixtures (3 台の実出力),
+`deploy/tarot.env.example` (`TAROT_WORKER_*`), `frontend/src/pages/AdminWorkers.tsx`,
+`frontend/src/components/ServerAvailabilityCard.tsx` / `WorkerHistoryChart.tsx`,
+`frontend/src/lib/workerStatus.ts`, `frontend/src/App.tsx` (Workers ナビとバッジ), locales
