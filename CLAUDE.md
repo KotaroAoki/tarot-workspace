@@ -4885,6 +4885,13 @@ WSL・Windows の再起動 (単発)。**未解決のイベントは DB に残り
 - `set-demo-group` は CLI (別プロセス) なので、**ログイン中のセッションには次のログインから**効く。
 - 画面は入口を隠すだけ (`lib/readOnly.ts` の `useReadOnly()`、`components/DemoBanner.tsx`)。
   隠し忘れたボタンを押しても 403 になる。
+- **閲覧専用のセッションには塩基配列を渡さない (GET でも 403)** (2026-10-05 ユーザー決定。
+  デモデータに院内株を含むため)。判定は `demo_mode.sequence_blocked` で、対象はコンティグの
+  FASTA / ZIP と Bakta・PlasAnn の出力ファイル。出力ファイルは**配列を含まない拡張子だけを許す**
+  (Bakta の `.gff3` は末尾に ##FASTA、`.json` は配列ごと持つので拒否側)。GFA は API が配列列を
+  `*` に置き換えるので対象外。**配列を返す API を新しく足したら `_SEQUENCE_PATHS` にも足すこと** —
+  こちらは書き込みと違って許可リストにできない (GET は全部通すので)。テストが本物のアプリの経路で
+  対象 4 本を縛っている。照合は `request.url.path` (エンコードを戻した形) で行う。
 - **デモデータ = MRSA (JAC-AMR 論文の 34 株, TUM 番号) + プラスミド (toho_micro_id の AA002 群, DEMO 番号)**。
   既存のリードを `tools/stage_demo_inputs.py` (dry-run 既定) でデモグループの `uploads/` へ**名前を付け替えて
   コピー**し、デモグループで解析し直す (DB はグループごとなので結果を複製すると ID の付け替えができない — #18)。
