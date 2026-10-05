@@ -4885,10 +4885,16 @@ WSL・Windows の再起動 (単発)。**未解決のイベントは DB に残り
 - `set-demo-group` は CLI (別プロセス) なので、**ログイン中のセッションには次のログインから**効く。
 - 画面は入口を隠すだけ (`lib/readOnly.ts` の `useReadOnly()`、`components/DemoBanner.tsx`)。
   隠し忘れたボタンを押しても 403 になる。
+- **デモデータ = MRSA (JAC-AMR 論文の 34 株, TUM 番号) + プラスミド (toho_micro_id の AA002 群, DEMO 番号)**。
+  既存のリードを `tools/stage_demo_inputs.py` (dry-run 既定) でデモグループの `uploads/` へ**名前を付け替えて
+  コピー**し、デモグループで解析し直す (DB はグループごとなので結果を複製すると ID の付け替えができない — #18)。
+  ファイル名は本物の `classify_directory` で分類を確かめてある (ONT = `_ont_runN`、MiSeq = `_runN_R1/R2`)。
+  **元の検体名をデモグループに残さない** — 対応表は手元のファイルにだけ書く。
 **該当ファイル**: `api/demo_mode.py` (新規), `api/routers/auth.py` (`require_session`, login, `_account_login`, `/me`),
 `api/routers/account_admin.py` (`_apply_demo_expiry`), `api/routers/account_self.py` (招待一覧),
 `api/services/account_store.py` (`groups.demo`, `accounts.expires_at`, `set_group_demo`, `set_account_expiry`),
 `api/services/ssh_manager.py`, `api/models/schemas.py`, `tools/manage_accounts.py`
 (`groups` / `set-demo-group` / `set-expiry`), `deploy/tarot.env.example`, `api/tests/test_demo_mode.py` (新規),
 `frontend/src/lib/readOnly.ts` / `components/DemoBanner.tsx` (新規), `frontend/src/App.tsx`,
-`frontend/src/pages/Results.tsx`, `frontend/src/lib/api.ts`, `frontend/src/index.css`, locales
+`frontend/src/pages/Results.tsx`, `frontend/src/lib/api.ts`, `frontend/src/index.css`, locales,
+`tools/stage_demo_inputs.py` (新規), `api/tests/test_stage_demo_inputs.py` (新規)
