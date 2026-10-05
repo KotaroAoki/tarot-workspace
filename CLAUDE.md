@@ -4892,8 +4892,12 @@ WSL・Windows の再起動 (単発)。**未解決のイベントは DB に残り
   `*` に置き換えるので対象外。**配列を返す API を新しく足したら `_SEQUENCE_PATHS` にも足すこと** —
   こちらは書き込みと違って許可リストにできない (GET は全部通すので)。テストが本物のアプリの経路で
   対象 4 本を縛っている。照合は `request.url.path` (エンコードを戻した形) で行う。
-- **デモデータ = MRSA (JAC-AMR 論文の 34 株, TUM 番号) + プラスミド (toho_micro_id の AA002 群, DEMO 番号)**。
-  既存のリードを `tools/stage_demo_inputs.py` (dry-run 既定) でデモグループの `uploads/` へ**名前を付け替えて
+- **デモデータ = 軽量案 17 検体** (2026-10-05 決定): MRSA (JAC-AMR 論文の 34 株から ONT 10 株 + MiSeq 1 株,
+  TUM 番号) + プラスミド (toho_micro_id の AA002 群から 6 株, DEMO 番号)。**cgSNP が要る MRSA だけをリードで、
+  プラスミド株は解析済みの contigs.fasta で投入する** (assembly_complete はアセンブリと cgSNP を飛ばすので
+  数 MB・短時間で済み、ヘッダの `_circular` で plasmid DB にも登録される想定 — 本番前に 1 株で確かめる)。
+  当初の 58 検体案 (約 25〜30 GB・7〜8 時間) は重いので採らなかった。
+  `tools/stage_demo_inputs.py` (dry-run 既定) でデモグループの `uploads/` へ**名前を付け替えて
   コピー**し、デモグループで解析し直す (DB はグループごとなので結果を複製すると ID の付け替えができない — #18)。
   ファイル名は本物の `classify_directory` で分類を確かめてある (ONT = `_ont_runN`、MiSeq = `_runN_R1/R2`)。
   **元の検体名をデモグループに残さない** — 対応表は手元のファイルにだけ書く。

@@ -7,12 +7,12 @@
 | 項目 | 決定 |
 |---|---|
 | 提供形態 | 本番 (公開サーバー) に**閲覧専用**のデモグループを置く |
-| データ | **MRSA = JAC-AMR 論文 (TAROT 検証) の 34 株** (公開済み)。**プラスミド = 過去の解析株 (toho_micro_id の AA002 群)**。どちらも既存のリードからデモグループへ名前を付け替えてコピーし、**デモグループで解析し直す** (2026-10-05 決定) |
+| データ | **軽量案 = 17 検体** (2026-10-05 決定)。**MRSA = JAC-AMR 論文 (TAROT 検証) の 34 株から 10 株を ONT リードで + 1 株を MiSeq で**。**プラスミド = 過去の解析株 (toho_micro_id の AA002 群) から 6 株を解析済みアセンブリ (FASTA) で**。どちらもデモグループへ名前を付け替えてコピーし、**デモグループで解析し直す** |
 | アクセス | **候補者ごとに個人アカウント** (招待 → 申請 → 承認)。2 段階認証あり・有効期限つき |
 | 見せたい特徴 | プラスミドの伝播 / cgSNP の系統解析とアウトブレイク / 菌種別のタイピング / レポートと操作性 (4 つすべて) |
 | ゲノム配列 | **デモ利用者には見せない** (コンティグ・Bakta / PlasAnn の配列ファイルはダウンロード不可。結果の画面だけ) |
-| 参照の無い ST | **「参照ゲノム無し」で止まってよい** (STany の参照は置かない) |
-| MiSeq のリード | 在処は不明 → ステージングツールの dry-run で確かめ、無ければ SRA から取得 |
+| 参照の無い ST | **「参照ゲノム無し」で止まってよい** (STany の参照は置かない)。軽量案ではそもそも入れない |
+| MiSeq のリード | 1 株分だけ使う。在処は不明 → ステージングツールの dry-run で確かめ、無ければ SRA から取得 |
 
 ## 1. アクセスの仕組み (実装済み: tarot-analyzer `claude/demo-readonly-group`)
 
@@ -58,7 +58,7 @@ python -X utf8 tools/manage_accounts.py --env-file ... set-expiry <候補者> 30
 ### パイプラインの制約から決まる条件
 | 見せたいもの | 必要な入力 | 理由 |
 |---|---|---|
-| プラスミドの距離マップ・構造比較・菌種をまたぐ伝播 | **閉環したプラスミド** (ONT のリード、または完全長の公開アセンブリ) | 環状に閉じていない contig は plasmid DB に登録されない (`require_circular`, #37.1)。Illumina だけでは「照会のみ」になる |
+| プラスミドの距離マップ・構造比較・菌種をまたぐ伝播 | **閉環したプラスミド** (ONT のリード、完全長の公開アセンブリ、または**社内で組み立て済みの contig**) | 環状に閉じていない contig は plasmid DB に登録されない (`require_circular`, #37.1)。Illumina だけでは「照会のみ」になる。アセンブリ投入では contig ヘッダの `_circular` で環状と判定される (`circularity_util.is_circular` のフォールバック) |
 | cgSNP (MST・距離行列・系統樹) | **リード** (Illumina か ONT)。1 つの species/ST 群に 4 株以上、できれば 10〜20 株 | 完全長アセンブリ入力では cgSNP を回さない。系統樹は `min_strains`=4 以上、それ未満では距離行列だけ (#31) |
 | Salmonella の血清型・cgMLST | Salmonella のリードが数株 | SeqSero2 と chewBBACA は Salmonella にだけ走る (#10) |
 | STEC の病原型アラート | 大腸菌 (stx / eae 陽性) | #33 |
@@ -67,17 +67,33 @@ python -X utf8 tools/manage_accounts.py --env-file ... set-expiry <候補者> 30
 - **DB はグループごとに分かれる** (`{グループのルート}/db/bam_db`, `db/plasmid_outbreak`)。
   デモの解析結果が既存グループの系統樹や照会に混ざることはない。参照ゲノム (`representative_genomes`) は共有。
 - 1 群の株数は 30 株未満に抑える (phylo の所要は株数の約 1.76 乗、#58)。
+- **アセンブリ (FASTA) で投入した検体は、アセンブリと cgSNP の段を飛ばす** (assembly_complete、
+  cgSNP は「リードが無い」で SKIPPED)。リードの数百 MB〜1.7 GB が数 MB になり、解析も短い。
+  cgSNP が要るのは同じ菌種・同じ ST の株を比べる MRSA だけなので、リードはそちらに絞る。
 
-### データセット (2026-10-05 決定)
+### データセット (2026-10-05 決定: 軽量案)
+
+| | 当初の案 (採らなかった) | **軽量案** |
+|---|---|---|
+| MRSA (cgSNP 用) | ONT 34 株 + MiSeq 4 株 | **ONT 10 株 + MiSeq 1 株** |
+| プラスミドの株 | ONT リード 15〜20 株 | **解析済みアセンブリ 6 株** (リード無し) |
+| 合計 | 約 58 検体 | **17 検体** |
+| コピーするデータ (概算) | 約 25〜30 GB | **約 3〜5 GB** |
+| 解析時間 (概算) | 7〜8 時間 | **2 時間前後** |
+
+容量は過去の実測 (S. aureus のリード 1 株 約 300 MB、腸内細菌 最大 1.7 GB) からの見積もり。
+時間は 1 株 40〜50 分 (#23) を 3 台 × 2 並列で回す前提。実際の容量はステージングツールの
+dry-run が行ごとに出す。
 
 **採らなかった案**: ロンドンの IMP 産生 CPE (PRJEB38818, J Infect Dis 2024, doi:10.1093/infdis/jiae019) は
 **Illumina のみで閉環プラスミドが無い** (論文の限界に明記)。TAROT は環状に閉じていない contig を
 plasmid DB に登録しない (#37.1) ため、主役の距離マップ・構造比較が出ない。
 
-#### A. MRSA — TAROT 検証論文の 34 株 (cgSNP・逐次解析・ONT/Illumina 比較)
+#### A. MRSA — TAROT 検証論文の 34 株から 10 株 (cgSNP・ONT/Illumina 比較)
 出典: Tracking Antimicrobial Resistant Organisms Timely: a workflow validation study for successive
 core-genome SNP-based nosocomial transmission analysis. JAC-AMR 2025 (doi:10.1093/jacamr/dlaf069)。
 東邦大学医療センター大森病院の MRSA 34 株を MinION (R10.4.1) と MiSeq の両方で読んだもの。SRA 公開済み。
+下の表は論文の 34 株 (選ぶときの候補一覧)。
 
 | ST | 株 (TUM 番号) | 見せ場 |
 |---|---|---|
@@ -86,10 +102,20 @@ core-genome SNP-based nosocomial transmission analysis. JAC-AMR 2025 (doi:10.109
 | ST5 (5) | 22457 22458 22701 22702 22707 | 伝播が強く疑われる組が 2 組。SCCmec II |
 | その他 (5) | 22723 (ST1516) / 20915 (ST2725) / 22741 (ST4143) / 22749 (ST2764) / 22730 (ST97) | 参照の無い ST の扱い (cgSNP は「参照ゲノム無し」で止まる。論文の bbsplit 分類とは挙動が違う) |
 
+**選ぶ株 (ONT 10 株)**:
+- **ST8 から 6 株**。伝播が強く疑われる組 (cgSNP <5) を 2 組含め、残り 2 株は離れた株にする
+  (近い組と遠い株が両方あると系統樹・MST が読みやすい)。4 株以上なので系統樹が出る。
+- **ST1 から 4 株**。20926 と 22188 を含める (約 21 kb の同じ環状プラスミドが単量体と 2 量体で
+  見つかった実例、#49 の AA411 = 21,326 bp)。残り 2 株は伝播が疑われる組にする。
+  4 株ちょうどなので系統樹が出る (`min_strains`=4)。**1 株でも解析に失敗すると距離行列だけになる**
+  ので、余裕を見るなら 5 株にする。
+- 具体的な組は既存の距離行列 (元の検体の `core_snp/core_snp_result.json`) か論文の補足表で決める。
+- ST5 と、参照ゲノムの無い ST (ST1516 / ST2725 / ST4143 / ST2764) の株は入れない。
+
+**MiSeq 1 株**: ST8 で選んだ株のうち 1 株を MiSeq でも投入する (`TUM20914_MiSeq` のように別検体)。
+ONT と Illumina は同じ BAM 群に同居し、同じ株が 0〜2 SNP になることを見せる (#37.3 / #38)。
+
 - 検体名は**論文と同じ `TUM20816` 形式**にする (論文の表と照合できるように)。
-- **ONT 34 株すべて + MiSeq 4 株** (`TUM20914_MiSeq` のように別検体)。MiSeq は ST8 の伝播組の両方と
-  ST1 の伝播組の両方を選ぶ (具体的な組は論文の補足表 / 既存の距離行列から決める)。
-  ONT と Illumina は同じ BAM 群に同居し、同じ株が 0〜2 SNP になることを見せる (#37.3 / #38)。
 - 既存の解析結果は NAS にある (CLAUDE.md の 20914 / 22173 / 22188 などがこの 34 株)。リードの在処は
   各検体の `results/{検体}/input_class.json`。**MiSeq のリードが NAS にあるかは分かっていない**
   (2026-10-05)。確かめ方は 2 通り:
@@ -102,18 +128,27 @@ core-genome SNP-based nosocomial transmission analysis. JAC-AMR 2025 (doi:10.109
   無ければ SRA から取得して、ファイルの組をマニフェストの `source` に直接書く
   (要確認: ワーカーに sra-tools があるか。無ければ ENA の FASTQ を院内の PC で取得して NAS に置く)。
 
-#### B. プラスミド — toho_micro_id の AA002 群 (菌種をまたぐ伝播)
+#### B. プラスミド — toho_micro_id の AA002 群から 6 株 (菌種をまたぐ伝播)
 - IncL/M・blaIMP-1・約 76.7 kb の閉環プラスミドが **14 菌種・34 株**に分布し、DCJ 0 の群が
   **11 菌種にまたがる** (#41 / #55)。距離マップ・構造比較・連鎖表示の見せ場がそろう。
-- **15〜20 株に絞る**: DCJ 0 の群から菌種が重ならないように 8〜10 株、DCJ が 0 でない株
-  (例: 19403 の 52 kb 反転、17575 の挿入) を 3〜4 株、別クラスタの対照を 2〜3 株。
-  候補の一覧は toho_micro_id の plasmid DB の `index.tsv` (`primary_cluster_id` = AA002) から作る。
+- **6 株に絞る**:
+  - **DCJ 0 の群から 4 株**。菌種が重ならないように選ぶ (同じプラスミドが菌種をまたぐことを見せる)。
+  - **19403** (52 kb の反転) と **17575** (挿入) — 構造比較・連鎖表示で構造の違いを見せる。
+  - 候補の一覧は toho_micro_id の plasmid DB の `index.tsv` (`primary_cluster_id` = AA002) と、
+    各検体の `{検体}_summary.json` の菌種から作る。
+- **リードではなく解析済みのアセンブリで投入する**: 元の検体の
+  `results/{検体}/assembly/long_read/contigs.fasta` (Flye → 多量体の縮約 → dnaapler 済み)。
+  ヘッダに `_circular` が付いているので、リード無しでも plasmid DB に登録されるはず
+  (公開アセンブリを同じ形で登録した前例 = harada_ndm)。**本番の前に 1 株で試す** (手順 0)。
+- 見せられるもの: 距離マップ (MST)、構造比較、連鎖表示、インテグロン (blaIMP-1 カセット)、
+  AMR とβ-ラクタマーゼの機能型分類、MLST、Genome Map。
+  **出ないもの**: cgSNP、リード QC、アセンブリグラフ、環状性の GFA 再判定 (circularity.json)。
 - 検体名は **`DEMO-P01` 形式に付け替える** (院内の検体番号を候補者に見せない)。
   対応表はステージングツールが**手元のファイル**に書き、NAS のデモグループには置かない。
 - 院内株なので**ゲノム配列はデモ利用者に見せない** (2026-10-05 決定)。閲覧専用のセッションでは
   配列のダウンロードを止めてある (上の「閲覧専用の守り方」)。見えるのは解析結果の画面だけ。
 
-合計 約 55〜60 検体 (MRSA 38 + プラスミド株 15〜20)。
+合計 **17 検体** (MRSA ONT 10 + MiSeq 1 + プラスミド株 6)。
 
 ### 架空のメタデータ (色分け軸・同一患者・地域を見せるため)
 - 取り込みテンプレート (Results → メタデータ取り込み) で登録する。
@@ -129,10 +164,18 @@ core-genome SNP-based nosocomial transmission analysis. JAC-AMR 2025 (doi:10.109
 
 ## 3. 手順 (作業はすべて院内 LAN から)
 1. `create-admin demo_curator` → `set-demo-group <id> on` (上の運用コマンド)。
+0. **プラスミド株 1 株で試す**: 手順 2〜5 を `DEMO-P01` の 1 行だけで回し、アセンブリ投入でも
+   plasmid DB に登録され (`plasmid_outbreak/registration.json` の `num_registered` が 1 以上)、
+   距離マップと構造比較が描けることを確かめる。登録されなければ残り 5 株もリードでの投入に切り替える。
 2. **マニフェスト (TSV) を作る**。列は `demo_name / kind / source` + 任意のメタデータ列
-   (`isolation_date / region / facility / specimen / patient_code`)。`source` は元の検体の
-   results ディレクトリ (例 `/mnt/nas/tarot/accounts/toho_omori/results/20816`)。
-   元の検体がどのグループにあるかは `ls -d /mnt/nas/tarot/accounts/*/results/20816` で探す。
+   (`isolation_date / region / facility / specimen / patient_code`)。
+   - MRSA (`kind=ont` / `illumina`): `source` は元の検体の results ディレクトリ
+     (例 `/mnt/nas/tarot/accounts/toho_omori/results/20816`)。
+   - プラスミド株 (`kind=contigs`): `source` は **contigs.fasta のパスを直接書く**
+     (例 `/mnt/nas/tarot/accounts/toho_micro_id/results/19403/assembly/long_read/contigs.fasta`)。
+     ツールは results ディレクトリを渡されると `input_class.json` の `contig_path`
+     (= 元からアセンブリで投入した検体の入力) しか探さないため。
+   - 元の検体がどのグループにあるかは `ls -d /mnt/nas/tarot/accounts/*/results/20816` で探す。
 3. **ワーカーでステージングツールを回す** (tarot-analyzer `tools/stage_demo_inputs.py`):
    ```
    python3 tools/stage_demo_inputs.py manifest.tsv \
@@ -140,36 +183,43 @@ core-genome SNP-based nosocomial transmission analysis. JAC-AMR 2025 (doi:10.109
        --metadata-out demo_metadata.csv --mapping-out ~/demo_mapping.tsv      # dry-run
    python3 tools/stage_demo_inputs.py ... --apply
    ```
-   リードを `uploads/demo_20261005/<デモ名>/` にコピーする (ONT = `<名前>_ont_runN.fastq.gz`、
+   リードとアセンブリを `uploads/demo_20261005/<デモ名>/` にコピーする (ONT = `<名前>_ont_runN.fastq.gz`、
    MiSeq = `<名前>_runN_R1/R2.fastq.gz`)。コピーしながら gzip を検査し、壊れていれば止める (#50)。
    同じ名前・同じサイズのファイルは飛ばすので、途中で止まっても再実行してよい。
 4. `demo_curator` で New Job → 入力ディレクトリに `uploads/demo_20261005` を指定。**Defer cgSNP phylo** を付ける
-   (#58 / #60)。全検体が終わってから Results で ST ごとに cgSNP を実行する (#68 で 1 群 1 回にまとまる)。
+   (#58 / #60)。全検体が終わってから Results で MRSA の 11 検体を選んで cgSNP を実行する
+   (#68 で ST8 と ST1 がそれぞれ 1 回にまとまる)。
 5. プラスミド関連性 (クラスタリング) をグループ全体で実行する (#42.1)。
 6. `demo_metadata.csv` を Results のメタデータ取り込みで読み込む。
 7. 候補者役のテストアカウントで確認する: 案内が出ること / 書き込みが 403 になること /
    見せ場の画面 (下の巡回順) がすべて描けること / **院内の検体番号がどこにも出ないこと**
    (JobDetail・プラスミド DB ブラウザ・cgSNP DB ブラウザ・HTML 書き出し)。
+   プラスミド株は contig のヘッダもコピーされるので、`grep '>' uploads/demo_20261005/DEMO-P*/*`
+   で元の検体番号が含まれていないことも見る (Flye のヘッダは `contig_N_length:…` で検体名を持たない想定)。
 8. 候補者を `demo_curator` のアカウント設定から招待する。
 
 ## 4. 見せ場の巡回順 (候補者向けの案内文に使う)
 1. Results 一覧 → 検体を 1 つ開いて**シンプルビュー / A4 レポート** (#53)
 2. 同じ検体の詳細ビュー: AMR とβ-ラクタマーゼの機能型分類 (#56)、インテグロン (#46)、Genome Map
 3. **プラスミド株 (DEMO-P..) の Plasmid & Replicon Map → 距離マップ**: 菌種で色分けし、同じ IncL/M・blaIMP-1 が
-   DCJ 0 のまま 10 菌種以上にまたがっているのを見せる (#41 / #55)。構造比較・連鎖表示で反転と挿入を見せる (#42)
-4. **MRSA の cgSNP**: ST8 / ST1 / ST5 の系統樹・MST・距離行列。伝播が強く疑われる組 (<5 SNP)、
+   DCJ 0 のまま 4 菌種にまたがっているのを見せる (#41 / #55)。構造比較・連鎖表示で反転と挿入を見せる (#42)
+4. **MRSA の cgSNP**: ST8 / ST1 の系統樹・MST・距離行列。伝播が強く疑われる組 (<5 SNP)、
    施設・分離日での色分け、同一患者の破線 (#69)。ONT と MiSeq の同じ株が 0〜2 SNP であること
-5. MRSA の SCCmec・毒力遺伝子、プラスミド株のインテグロン (blaIMP-1 カセット、#46)
+5. MRSA の毒力遺伝子と ST1 の 21 kb プラスミド (単量体 / 2 量体)、プラスミド株のインテグロン (blaIMP-1 カセット、#46)
 6. 日英切替
 
 ## 5. 未決事項 / リスク
-- [ ] MRSA 34 株の元の検体の在処 (グループ) と、MiSeq のリードが NAS にあるか
+- [ ] MRSA 10 株を選ぶ (ST8 6 株・ST1 4〜5 株。伝播が疑われる組は既存の距離行列から)。
+      元の検体の在処 (グループ) と、MiSeq 1 株分のリードが NAS にあるか
       (ステージングツールの dry-run で確かめる。無ければ SRA から取得)。
-- [ ] AA002 群から 15〜20 株を選ぶ (index.tsv から)。
+- [ ] AA002 群から 6 株を選ぶ (DCJ 0 の 4 菌種 + 19403 + 17575)。
+- [ ] アセンブリ投入で plasmid DB に登録されるかを 1 株で確かめる (手順 0)。
+- [ ] (任意) ステージングツールの `kind=contigs` が results ディレクトリを渡されたとき
+      `assembly/long_read/contigs.fasta` も探すようにする。今はマニフェストにパスを直接書けば足りる。
 - [x] 院内株のゲノム配列はデモ利用者に見せない (決定・実装済み: 閲覧専用では配列のダウンロードを 403)。
       **解析結果 (AMR 遺伝子・プラスミドの構造図など) を外部に見せてよいかの施設の確認は別途必要。**
 - [x] cgSNP の参照が無い ST (ST1516 / ST2725 / ST4143 / ST2764) は「参照ゲノム無し」で止まってよい (決定)。
-      STany の参照は置かない。論文の bbsplit 分類とは挙動が違うことを案内文で一言断る。
+      STany の参照は置かない。軽量案ではこれらの株を入れないので、案内文での断りも不要になった。
 - [ ] 候補者の 2 段階認証: パスキーまたは認証アプリの登録が必要で、デモとしては手間がかかる。
       案内文で手順を示す (共有アカウントにはしない、#62/#70)。
 - [ ] 1 ログインにつきワーカーへの SSH 接続を 1 本使う。同時に多数の候補者が使う場合の上限
