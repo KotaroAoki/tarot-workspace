@@ -4866,3 +4866,29 @@ WSL・Windows の再起動 (単発)。**未解決のイベントは DB に残り
 `deploy/tarot.env.example` (`TAROT_WORKER_*`), `frontend/src/pages/AdminWorkers.tsx`,
 `frontend/src/components/ServerAvailabilityCard.tsx` / `WorkerHistoryChart.tsx`,
 `frontend/src/lib/workerStatus.ts`, `frontend/src/App.tsx` (Workers ナビとバッジ), locales
+
+### 75. デモグループ (閲覧専用) とデモアカウントの有効期限
+**目的 (2026-10-05)**: 手持ちのデータが無い利用候補者に、公開データの解析結果を本物の画面で見せる。
+計画とデータセットの候補は `PLAN_demo_session.md`。
+- `groups.demo = 1` のグループでは **admin 以外が閲覧専用**。判定は `api/demo_mode.py` だけが持つ。
+  ログイン時に `SessionInfo.read_only` / `expires_at` へ書き込み、**`require_session` が
+  GET / HEAD / OPTIONS 以外を 403 にする**。全ての認証付き API がここを通るので、新しい書き込み API も
+  自動的に拒否される側に入る。許可リスト (2 段階目・メール確認・パスキー・コンティグ ZIP) に
+  足すのは「グループのデータもワーカーも変えない」ものだけにすること。
+  テストが本物のアプリの全ルートを走査して許可リストを固定している (`test_demo_mode.py`)。
+- **招待は許さず、招待一覧も見せない**。デモグループは無関係な施設の候補者の集まりなので、
+  招待の宛先 = 他の候補者のメールアドレスになる。
+- 有効期限は、デモグループへの参加を承認したとき (とデモグループへ移したとき) に入る
+  (`TAROT_DEMO_ACCOUNT_DAYS`、既定 30。延長は `manage_accounts.py set-expiry`)。
+  読めない期限の値は「期限なし」ではなく**期限切れ**として扱う。
+- デモデータの解析と候補者の招待は、デモグループ所属の **admin** (`demo_curator`、院内 LAN からのみ) が行う。
+- `set-demo-group` は CLI (別プロセス) なので、**ログイン中のセッションには次のログインから**効く。
+- 画面は入口を隠すだけ (`lib/readOnly.ts` の `useReadOnly()`、`components/DemoBanner.tsx`)。
+  隠し忘れたボタンを押しても 403 になる。
+**該当ファイル**: `api/demo_mode.py` (新規), `api/routers/auth.py` (`require_session`, login, `_account_login`, `/me`),
+`api/routers/account_admin.py` (`_apply_demo_expiry`), `api/routers/account_self.py` (招待一覧),
+`api/services/account_store.py` (`groups.demo`, `accounts.expires_at`, `set_group_demo`, `set_account_expiry`),
+`api/services/ssh_manager.py`, `api/models/schemas.py`, `tools/manage_accounts.py`
+(`groups` / `set-demo-group` / `set-expiry`), `deploy/tarot.env.example`, `api/tests/test_demo_mode.py` (新規),
+`frontend/src/lib/readOnly.ts` / `components/DemoBanner.tsx` (新規), `frontend/src/App.tsx`,
+`frontend/src/pages/Results.tsx`, `frontend/src/lib/api.ts`, `frontend/src/index.css`, locales
