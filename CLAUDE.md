@@ -4909,3 +4909,42 @@ WSL・Windows の再起動 (単発)。**未解決のイベントは DB に残り
 `frontend/src/lib/readOnly.ts` / `components/DemoBanner.tsx` (新規), `frontend/src/App.tsx`,
 `frontend/src/pages/Results.tsx`, `frontend/src/lib/api.ts`, `frontend/src/index.css`, locales,
 `tools/stage_demo_inputs.py` (新規), `api/tests/test_stage_demo_inputs.py` (新規)
+
+### 76. NAS の容量 (ワーカー監視) と利用者ごとのデータ保持量 (アカウント管理)
+**目的 (2026-10-06)**: ワーカー監視に NAS の容量を出し、アカウント管理で「誰が何検体を解析し、
+NAS をどれだけ使っているか」を見られるようにする。
+- **NAS の容量**は毎分の probe (`worker_probe_remote.probe_nas`) で取る。CIFS の statvfs は
+  止まりうるので `os.statvfs` ではなく **タイムアウト付きの `stat -f`**。読めなくても
+  「劣化」にはしない (疎通は `stat_ok` で別に見ている)。NAS は全台共通なので、画面は
+  **1 枚のカード** (いちばん新しく読めた台の値) と推移 1 本にまとめる。空きが
+  `TAROT_WORKER_NAS_FREE_GB` (既定 4096) を下回ると赤・2 倍までを黄。**通知はしない**
+  (ワーカーごとの通知にすると同じ内容が台数分届く)。履歴 DB に `nas_free` / `nas_total` 列を
+  追加 (既存 DB は ALTER TABLE で足す)。
+- **利用者ごとの使用量は画面を開いたときに数えない。** NAS のアカウント領域を全部たどると
+  数十分かかる (実測: Mac の SMB 越しに toho_omori 324 検体 / 64,000 ファイルで 3 分、
+  4 グループ 14,000 ファイルで 52 秒)。`NasUsageScanner` (api/services/nas_usage.py) が
+  毎日 `TAROT_NAS_USAGE_HOUR` 時台 (既定 3 時) と管理者の「今すぐ集計」で、NAS に届いている
+  いちばん空いたワーカーに `nas_usage_remote.py` を置いて **nohup で起動し、30 秒ごとに
+  状態ファイルを見る** (SSH のチャネルを走査中ずっと握らない)。出力はワーカーのローカル
+  (`~/.cache/tarot_nas_usage/`)、NAS には書かない。結果は worker_metrics.db の
+  `nas_usage_scans` (JSON は直近 10 回分) と `nas_usage_groups` (推移用の要約)。
+  API が再起動しても「実行中」の記録から待ち直す。
+- 走査はシンボリックリンクをたどらない (`input/contigs.fasta` やアップロードの重複検知は
+  リンクなので、たどると二重に数える)・ハードリンクは 1 回・読めなかったものは件数と
+  先頭 20 件を残す (画面に「その分だけ合計が少なく出ている」と出す)。
+- **割り当て (`build_storage_report`, 純関数)**: `results/{検体}` を、その検体を**最後に
+  解析したジョブ**のアカウントに割り当てる (完了したジョブを優先)。後追い実行
+  (`adhoc_` / `bakta_` / `plasmid_cluster_`) は数えない (ID が `YYYYMMDD_HHMMSS_hex` の
+  ジョブだけ)。ジョブの記録が無い検体は誰にも寄せず「割り当てなし」。
+  **results 直下の `plasmid_clusters` と `.` で始まるものは検体ではない** — 数えると
+  全グループに「記録の無い検体」が 1 件ずつ現れる (実測で踏んだ)。results 以外の最上位
+  (uploads / pod5 / dorado_* / bam_cache / db …) はグループの「検体以外」。
+  グループを移した人のデータは元のグループに残るので、`by_group` で出す。
+- 実データ (ローカルの古い tarot.db + NAS 4 グループ) で、すべての検体が利用者に割り当たることを確認。
+**該当ファイル**: `api/services/nas_usage.py` / `nas_usage_remote.py` (新規),
+`api/services/worker_probe_remote.py` (`probe_nas`), `worker_monitor.py` (`nas_*`, thresholds),
+`worker_metrics_store.py` (列追加と集計の表), `api/routers/account_admin.py`
+(`GET /storage`, `POST /storage/scan`), `api/routers/workers.py` (`nas`), `api/main.py`,
+`api/tests/test_nas_usage.py` (新規), `deploy/tarot.env.example`,
+`frontend/src/components/StorageUsagePanel.tsx` (新規), `AccountAdminPanel.tsx`,
+`pages/AdminWorkers.tsx` (`NasCapacityCard`), `lib/api.ts`, `lib/workerStatus.ts` (`fmtBytes`), locales
