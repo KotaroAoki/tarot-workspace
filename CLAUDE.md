@@ -1110,6 +1110,56 @@ UI (`CoreSnpSection` / `CoreSnpDbBrowser`) に混在を明示する。
 - **2 株だけの比較は ClonalFrameML が走らない** (`if n_strains >= 3`)。
   ペア距離は「ペアだけで測り直す」のではなく**群単位の距離行列から読む**こと。
 
+### 38.1 参照に無い高コピーのプラスミドが、同じ株の組に見かけの SNP を作る (被覆が 4 倍超の位置を外す)
+**発端 (2026-10-06)**: デモグループで、同じ株を ONT と MiSeq で読んだ TUM20914 が **5 SNP** 離れた
+(#38 の 79 組は 0〜2 SNP)。本番と同じ関数で再計算して 5 を再現したうえで、位置ごとに調べた。
+
+**仕組み**: TUM20914 は 30,214 bp の環状プラスミドを染色体の約 6 倍のコピー数で持つ。
+**参照は染色体だけ** (変えないこと — ユーザー決定) なので、プラスミドのリードは行き場がなく、
+一部だけ似ている染色体の位置に局所的に並べられる (残りはソフトクリップ)。コピー数が多いので
+本来のリードを数で上回り (違う塩基が 75〜89%)、VarScan がそれを株の塩基と判定する。
+ONT 側 (wgsim の疑似リード + bwasw) と MiSeq 側 (bwa mem) で積み上がる場所が違うので差になる。
+- ONT 側: 1,948,617〜1,950,224 の 27 か所 (被覆 約 1,700× = 通常の十数倍)。**組換え除去で消えていた**
+- MiSeq 側: 2,524,436 と 2,698,571〜2,698,620 の 5 か所 (被覆 140〜156 / 通常 31)。**これが残った 5 SNP**
+- 違う塩基を持つ MiSeq のリードはプラスミドと 98.4〜98.5% 一致、染色体とは 45% 前後。
+- 参照ゲノム上は反復配列ではない (k-mer で確認)。「参照に無い、検体だけが持つ配列」から来る点が
+  #38 (反復配列) と違う。
+
+**効かなかった方法 — 大きく切り捨てられたリードを除く**: 誤ったリードは読み長の 6〜8 割が
+切り捨てられていたが、**MAPQ は中央値 43〜48 と高い** (MAPQ の足切りでは取れない)。
+切り捨て 2 割以上のリードを除くと TUM20914 は 5 → 2 (0.1・0.3 では 0)。切り捨ての少ない
+誤り (ほぼ全長で並ぶよく似た配列) が残り、しきい値によって結果が揺れた。
+
+**採用した方法 — 被覆で外す**: 見かけの差を作った位置は、どれも**その検体の通常の被覆の
+5〜8 倍**だった (切り捨ての少ない誤りも含めて)。どれか 1 検体でも被覆 (VarScan の Cov) が
+**その検体のコアの中央値の 4 倍**を超える位置をコアから外す (`core_snp.depth_mask_factor: 4`)。
+4 つの群 (デモ ST8 / toho_micro_id_bsi の ST8 28 株・ST1 20 株 = ONT 同士 24 組 /
+kaoki_stec H36 の ONT/Illumina 15 組) で 3・4・5 倍を比べた:
+
+| | k=3 | **k=4** | k=5 |
+|---|---|---|---|
+| TUM20914 ONT 対 MiSeq (5) | 0 | **0** | 1 (4.9 倍の位置が残る) |
+| ONT 同士 24 組 / ONT-Illumina 15 組 | 不変 | **不変** | 不変 |
+| 他の株同士の距離の変化 (最大) | 3〜14 | **1〜3** | 0 |
+| コアから外れる割合 | 0.4〜2.3% | **0.1〜0.6%** | 0.01〜0.3% |
+
+- **kaoki_stec の ONT/Illumina で残る 1〜4 SNP は別の原因**。被覆は通常の範囲で、片方の機器が
+  100% 別の塩基を読んでいる (機器固有の読み誤り)。どの k でも変わらない。
+- 判定は `iter_core_rows` (コアに入るかの唯一の判定) を通す。中央値の計算と配列の組み立てで
+  条件を写さない。**除外なし (factor=0) は書き換え前とバイト単位で同じコア**になることを、
+  乱数で作った 2 万行で確かめてある。
+- 中央値は検体ごと (MiSeq の 31× と ONT の 200× を同じ物差しで測らない)。中央値 0 の検体には上限を付けない。
+- 結果の JSON の `depth_mask` に倍数・外した位置の数・検体ごとの中央値を残す。**この鍵が無い結果は
+  除外を入れる前の版**。同じ群でも、入れる前後の結果は距離が少し違いうる。
+- `cgsnp_subset.py` の既定も 4 (`--depth-mask-factor 0` で従来どおり)。
+- 評価の道具と結果は NAS の `tmp/demo_snp_check/` と `tmp/cgsnp_clip_eval/`
+  (`evaluate_clip_filter.py` / `evaluate_depth_mask.py` / `pair_sites.py`、`result/*.json`)。
+**該当ファイル**: `workflow/scripts/run_core_snp_phylo.py` (`iter_core_rows`, `core_depth_medians`,
+`depth_limits`, `depth_exceeding`, `run_mpileup_consensus(depth_mask_factor=, stats=)`, `--depth-mask-factor`),
+`workflow/rules/stage2_core_snp.smk`, `workflow/scripts/cgsnp_subset.py`,
+`config/config.yaml` / `config.multiserver.yaml` の `core_snp.depth_mask_factor`,
+`workflow/tests/test_core_snp_depth_mask.py` (新規)
+
 ### 39. dorado の中間 BAM (dorado_runs) は完了時に消す — 下流が読むのは fastq
 **背景 (2026-08-28)**: `_process_single_pod5` は 1 pod5 ごとに basecall → demux し、
 demux BAM を NAS の `dorado_runs/{job_id}/demux/chunk_NNN/` へコピーする。
