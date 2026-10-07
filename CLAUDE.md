@@ -5008,3 +5008,84 @@ NAS をどれだけ使っているか」を見られるようにする。
 `api/tests/test_nas_usage.py` (新規), `deploy/tarot.env.example`,
 `frontend/src/components/StorageUsagePanel.tsx` (新規), `AccountAdminPanel.tsx`,
 `pages/AdminWorkers.tsx` (`NasCapacityCard`), `lib/api.ts`, `lib/workerStatus.ts` (`fmtBytes`), locales
+
+### 77. ロゴを基調にしたブランド・ランディングページ・施設の分離の補強 (計画は PLAN_brand_and_landing_page.md)
+**背景 (2026-10-07)**: 株式会社TAR が有償で提供するにあたり、ロゴ (墨色の線画アイコン 8 個 +
+細い文字のロゴタイプ) を基調に見た目を揃え、`/` にランディングページ (LP) を置く。
+デモ (個人・閲覧専用・即時) → トライアル (施設単位・60 日・24 クレジット) → 本契約 の流れを
+LP から始められるようにする。**今回入ったのは段階 1 (ブランド)・2 (LP)・4 (施設の分離)**。
+段階 3 (デモの即時開始) と 5・6 (トライアル・本契約) は未着手。
+
+**ブランド**:
+- ロゴの元データは Canva の書き出し (`ロゴ/08_TAROT-Analyzer/TAROT-Analyzerロゴ.svg`)。
+  Canva の素材のアイコンを含むロゴは商標登録できないので、**アイコン 8 個は描き直した**
+  (案 B = 簡潔な中太の線 / LP の機能紹介は案 C = B に灰色を足した 2 トーン。3 案の比較は
+  `design_drafts/icon_proposals_v1.html`)。ロゴタイプは輪郭化済みなのでそのまま取り出した。
+- **形は `frontend/src/components/brand/` だけが持つ** (`brandIconShapes.tsx` / `wordmarkData.ts`。
+  後者は元の SVG から生成したので手で編集しない)。アプリ・ログイン画面・LP・ファビコンが同じ形を使う。
+- `src/brand.css` は `apple-design.css` と同じく **1 行の import で外せる層**。墨色 (`--color-ink`) は
+  ロゴ・見出しだけ。**操作の色 (青)・状態の色・図の配色は変えない** (色覚の検証済み)。
+- ヘッダーのロゴタイプは 170px (旧の文字は 196px) なので、折り返しの閾値 (1200px) は
+  そのままで成り立つ (1200px で 1 行・1199px で 2 段を実測)。
+- ファビコンは Vite の既定 (紫の稲妻) のままだったので、墨色の地に白い「T」に替えた。
+  `apple-touch-icon.png` は PIL で T の輪郭から描いた (**Mac の PIL は x86_64 版なので
+  `arch -x86_64` で動かす**。qlmanage は SVG を枠いっぱいに描かない)。
+
+**LP**:
+- 文言は `frontend/landing/content.ts` に日英を同じ型で持つ (片方だけ足すと型で落ちる)。
+  **`src/` の外に置いてある** — アプリの未翻訳チェック (`i18n_scan`) は `src/` の日本語を数えるため。
+- `npm run build` の最後で `react-dom/server` により **静的な HTML 1 枚 (`dist/lp/index.html`)
+  に書き出す** (日英 2 ページ・CSS と図は埋め込み・約 83 KB)。訪問者はアプリ本体 (React・d3) を
+  読み込まない。表示言語はアプリと同じ鍵 (`tarot.lang`) に保存する。ログイン中かは
+  セッションの登録簿 (`tarot_sessions`) で判断し、ボタンを「ダッシュボードへ」に替える。
+- **`/` で LP を返すのは `TAROT_SERVE_LANDING=true` のときだけ** (`api/frontend_static.py`)。
+  料金と規約が決まるまでは false。**false でも `/lp/index.html` で本番の LP を下見できる**。
+- **ダッシュボードは `/dashboard` に移した**。アプリ内の `/` への移動はアプリ側が `/dashboard` へ
+  送るので、LP を有効にしていなくても動く。
+- 日英のページが同じ文書に並ぶので、**ページ内の id には言語を付ける** (`ja-flow` 等)。
+- LP の申込ボタンは `/login?signup=trial` (「新しい施設」の申請を開く) と
+  `/login?signup=demo` (段階 3 で受け口を作る。今は通常のログイン画面)。
+- **まだ入っていないもの**: スクリーンショット (デモグループから撮る)、OGP 画像、料金、
+  問い合わせ先、規約類、英文社名 (仮に「TAR Inc.」)。
+
+**施設の分離の補強 (計画書 6 章)**:
+1. **ワーカーの BAM キャッシュに施設が入っていなかった** (`bam_cache/{菌種}/{群}/{検体名}.bam`)。
+   別の施設に同じ検体名 (`barcode01` 等) があると同じファイルを上書きし合い、一方の系統解析が
+   もう一方の施設の BAM を読みえた。**bam_db のパスから施設の鍵を作り** (`bam_cache_tenant`)、
+   `bam_cache/t_{グループ}-{ハッシュ}/{菌種}/{群}/` に分けた。施設を渡されなければキャッシュを
+   使わない。旧版の置き場所は 6 時間更新が無ければ消す (デプロイ直後に旧版の処理が読んでいる
+   途中のものを消さないため)。
+2. **施設由来の参照ゲノム (#31) が全グループ共有の置き場所にあった**。別の施設が同じ菌種・ST を
+   解析するとその参照に当たり、**参照のファイル名に入っている元の検体名が結果に出る**。
+   グループ専用の置き場所 `{グループのルート}/db/references` を作り、**bam_db の隣から導く**
+   (`isolation_dates.json` と同じ作り。API・ルール・config の変更なし)。探す順は
+   **グループの ST → 共有の ST → グループの STany → 共有の STany** で、`core_snp_reference.py`
+   だけが決める (BAM 作成と系統解析が同じ関数を通る)。参照の同一性は
+   (ST のディレクトリ名, ファイル名) で比べるので、置き場所を移しても既存の BAM は無効にならない。
+   - `promote_inhouse_reference.py` はグループ専用の置き場所にしか置かない
+     (共有は `--allow-shared`、別グループは拒否)。
+   - **既存の 4 本の移動は未実行**。`tools/scope_inhouse_references.py` (確認だけが既定)。
+     **新しい版の workflow を本番に反映してから実行すること** — 旧版は共有の置き場所しか
+     見ないので、先に移すと元の施設の cgSNP も「参照なし」になる。
+   - **実測 (2026-10-07): 施設をまたいだ利用が既に起きていた。** toho_micro_id_bsi 由来の
+     Cfreundii ST581 は toho_micro_id (1 本)、Eludwigii ST15 は toho_micro_id と kojima
+     (各 1 本) でも BAM の作成に使われていた。tmuh 由来の 2 本 (Enterococcus ST2822 / ST2158) は
+     tmuh だけ。他グループが使っている参照は既定で止まり、`--force` (元のグループへだけ移す) か
+     `--copy-to-users` (使っているグループにも複製。**互いに見えてよいグループの場合だけ**) を選ぶ。
+
+**検証のしかた (ログイン後の画面)**: Mac の API は起動しない (二重ディスパッチ)。
+`/api/auth/me` だけに 200 を返す仮 API (ジョブを扱わない) を 8000 番で立て、sessionStorage に
+仮のセッションを入れてヘッダーを実測した。仮 API が無いと `/me` が失敗してセッションが消える
+(正しい動作)。
+
+**該当ファイル**: `frontend/src/components/brand/` (新規), `frontend/src/brand.css` (新規),
+`frontend/landing/` (新規), `frontend/tools/vite.landing.config.ts` / `build-landing.mjs` (新規),
+`frontend/package.json` (`build:landing`), `frontend/public/favicon.svg` / `apple-touch-icon.png`,
+`frontend/src/App.tsx` (`/dashboard`), `frontend/src/pages/Login.tsx` (ロゴの組み・`?signup=trial`),
+`api/frontend_static.py` (`TAROT_SERVE_LANDING`), `api/tests/test_production_serving.py`,
+`deploy/tarot.env.example`, `workflow/scripts/run_core_snp_phylo.py` (`bam_cache_tenant`,
+`localize_bams(tenant=)`, `get_reference_for(bam_db=)`), `workflow/scripts/run_core_snp_map.py`
+(`find_reference(bam_db=)`), `workflow/scripts/core_snp_reference.py` (新規),
+`tools/promote_inhouse_reference.py` (`destination_problem`), `tools/scope_inhouse_references.py` (新規),
+`tools/import_assembly_bams.py`, `workflow/tests/test_bam_cache_isolation.py` /
+`test_core_snp_reference.py` (新規)
