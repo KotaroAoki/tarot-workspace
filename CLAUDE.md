@@ -5041,7 +5041,8 @@ LP から始められるようにする。**入ったのは段階 1 (ブラン�
 - LP の申込ボタンは `/login?signup=trial` (「新しい施設」の申請を開く) と
   `/login?signup=demo` (段階 3 で受け口を作る。今は通常のログイン画面)。
 - **まだ入っていないもの**: スクリーンショット (デモグループから撮る)、OGP 画像、料金、
-  問い合わせ先、規約類、英文社名 (仮に「TAR Inc.」)。
+  問い合わせ先、規約類。TAR = **Tracking Antimicrobial Resistance** (2026-10-07 決定。フッターに記載)。
+  英文社名の語尾 (Inc. / Co., Ltd.) は未決で、仮に「TAR Inc.」。
 
 **施設の分離の補強 (計画書 6 章)**:
 1. **ワーカーの BAM キャッシュに施設が入っていなかった** (`bam_cache/{菌種}/{群}/{検体名}.bam`)。
@@ -5100,6 +5101,12 @@ LP から始められるようにする。**入ったのは段階 1 (ブラン�
 - デモのバナーに「自施設のデータで試す」(`/login?switch=1&signup=trial`、別ウィンドウ) を足した。
 - **画面の確認で踏んだもの**: 自動操作の `form_input` でチェックボックスを入れても React の onChange が
   走らず、ボタンが押せないままになる。本物のクリックなら動く (アプリの不具合ではない)。
+- **Windows のテストで踏んだもの (setup.ps1 が止まった)**: 登録・申請の通知は応答の後に**裏のタスクで**
+  送る (`SignupNotifier.notify` → `create_task`)。テスト用の `TestClient` を `with` なしで使うと
+  **リクエストごとにイベントループを閉じる**ので、裏の送信が間に合わず記録されないことがある
+  (Mac では通り、Windows で落ちた = タイミング次第)。本番の API はループを閉じないので問題ない。
+  テストでは `notify` を差し替えて「頼んだこと」を同期的に記録し、文面とまとめ方は通知の単体テストで
+  確かめる。**裏のタスクの結果を API のテストで直接待たないこと。**
 **該当ファイル (段階 3)**: `api/demo_mode.py` (`self_signup_enabled`, `resolve_demo_group`, `mfa_exempt`,
 `max_sessions`, `session_idle_s`), `api/routers/auth.py` (`_demo_signup`, `_finish_demo_signup`,
 `_demo_signup_available`, ログインの 2 段階認証の判定, `_account_login` の上限, `require_session` の
