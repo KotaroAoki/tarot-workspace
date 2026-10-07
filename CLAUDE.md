@@ -5119,3 +5119,108 @@ LP から始められるようにする。**入ったのは段階 1 (ブラン�
 `api/services/account_mail.py` (`demo_welcome`), `api/models/schemas.py`, `deploy/tarot.env.example`,
 `api/tests/test_demo_self_signup.py` (新規), `api/tests/test_signup_invitations.py`,
 `frontend/src/pages/Login.tsx`, `frontend/src/lib/auth.tsx`, `frontend/src/components/DemoBanner.tsx`, locales
+
+### 78. ハイブリッドアセンブリ (研究用) と入力の種類の表示 (計画は PLAN_hybrid_assembly.md)
+**位置づけ (2026-10-07 ユーザー決定)**: **研究用オプション**。古い ONT R9.4.1 のリードを
+Illumina と組み合わせて使うためのもの。日常の解析 (R10 sup 長鎖単独 / Illumina 単独) は変えない。
+New Job の「ハイブリッド (研究用)」を選んだジョブ (`config_overrides.hybrid_assembly=true`。
+許可リスト `USER_CONFIG_OVERRIDE_KEYS` に追加、値は真偽のみ) で、長鎖と短鎖が同じ検体フォルダに
+ある検体だけが **Unicycler** で組まれる。選ばなければ従来どおり SPAdes 単独 (長鎖は使わない)。
+
+**Unicycler を選んだ理由 (実測 2026-10-07, proteus 11514, R9.4.1 RBK004 + MiSeq)**:
+Unicycler は 45 分で 3 本とも環状に閉じた (4,016,264 + 38,901 + 16,436 bp)。Flye `--nano-raw` は
+6 contig で 55 kb の重複 contig を出し、Polypolish (2,842 か所) + Pypolca (31 か所) で研磨しても
+Unicycler と 119 置換 + 31 挿入欠失の差が残った。長鎖主導で R9 を扱うには日常の Flye ルールに
+R9 用の分岐が 3 つ要る (下記) ので採らなかった。
+- **fastplong は既定で品質フィルタが有効** (`-q 15 -u 40`: Q15 未満の塩基が 40% を超えるリードを捨てる)。
+  R9 のリードは大半がこれに落ちる。ハイブリッドの経路は長さ (1 kb) だけでふるう。
+- Flye の入力モードは R10 前提の `--nano-hq`。medaka のモデルは古いベースコーラーに合わせられない。
+- **Unicycler の後に Polypolish だけをかける (Pypolca は使わない)**。Unicycler が長鎖の配列
+  そのもので橋渡しした区間には R9 の読み誤り (主にホモポリマーの欠失) が残る。実測 11529
+  (2019 年の古い Guppy, 平均 Q 約 10): Polypolish が 318 か所を書き換え、**314 か所は独立に組んだ
+  SPAdes が書き換え後の配列を持っていた (書き換え前は 0)**。11514 (Guppy 5 hac) は 0 か所。
+  Pypolca (careful) は 11514 で 8 か所 (4 か所は SPAdes と食い違い、4 か所は多コピー配列で判断不能)、
+  11529 で 15 か所 (SPAdes が支持したのは 7 か所) で信用できない。短鎖が 25x 未満なら `--careful`。
+  **判定の型**: 書き換え前後の前後 20 bp ずつの配列が、独立に組んだアセンブリにどちらで載っているかを数える。
+  本番のルールでの通し検証 (2026-10-07, honban スクラッチ): 11514 は 51 分で 61 工程すべて成功
+  (環状 3 本・プラスミド 2 本を DB に登録)、11529 は短鎖を 500 Mb に間引いて Unicycler が約 50 分
+  (間引く前は 2 時間 35 分)、Polypolish 396 か所、入力一致 pass。
+
+**置き場所と DAG**: 今の hybrid の分岐 (SPAdes ルール、`assembly/short_read/`) の中で
+SPAdes の代わりに Unicycler を呼ぶ。出力ファイル名は同じなので、他モードの DAG も
+`assembly/short_read/` を読む API・backfill も無改修。長鎖は**ハイブリッドを選んだ hybrid 検体のときだけ**
+input に入る関数 (`_hybrid_long_reads`) で渡す。記録は `assembly/short_read/hybrid/hybrid_report.json`
+(**宣言しない出力** — 宣言すると既存検体で「出力が欠けている」として spades_assembly が再実行される)。
+per_sample_report と register_plasmids_to_db は params で読む。
+- 量の上限: 短鎖・長鎖とも 500 Mb を超えたら無作為に間引く (短鎖は R1/R2 を同じ割合・同じ seed)。
+  実測 11529 (短鎖 約 390x) は Unicycler の SPAdes の段階だけで 2 時間超かかった。
+- 起点は Unicycler の回転を止め (`--no_rotate`)、長鎖の経路と同じ dnaapler で合わせる (#42.4)。
+- contig 名は `contig_N_length:L_circular` にそろえる (`hybrid_assembly.py normalize`。Polypolish は
+  ヘッダ末尾に ` polypolish` を足すだけで `circular=true` は残る。書き換え数は `hybrid_report.json` の `polish`)。
+  **Unicycler の `depth=` は染色体を 1 とした相対値なので名前 (`cov:`) に入れない** (#37 の k-mer 被覆と同じ教訓)。
+- 画面のアセンブラ判定 (`lib/assemblySource.ts`) は `/assembly` の mode だけでは区別できないので、
+  レポートの `input_summary.assembler` を見る (`unicycler`)。
+
+**入力一致の確認 (2 つのリードが同じ株か)** — 決定: 別株なら**検体を止めて DB に登録しない**。
+長鎖を最終アセンブリに minimap2 で並べ、`samtools consensus -c 0.9 -d 10` の多数決とアセンブリが
+食い違う**置換**を、多数決が付いた位置 10,000 個ごとの窓で数える。**置換を含む窓の割合 > 30%** で別株。
+- **一致率の平均では見分けられない** (R9 は 1 本ずつの誤りが 5〜10%、別 ST でも ANI 99% 前後)。
+- **置換の総数でも決めない。** 断片化した SPAdes のアセンブリ相手では、同じ株でも潰れた反復配列に
+  偽の置換が集まる (実測 TAS006: 370 置換。置換位置で別の塩基を支持する長鎖は中央値 85% で、
+  本物の SNP の 97〜98% より低い)。窓の割合なら局所的な偽物に強い。
+- 実測 (多数決 90%): 同じ株 1〜11% (R9 11514 自身 5% / 2019 年の古い R9 の 11529 が 10.5% / R10 kaoki 6 組 1〜2%)、
+  別株 73〜100% (同じ ST11 の TAS132/204/213 73〜79%、TAS023 96%、R9 の 11529 を 11514 に 99%、別 ST 100%)。
+- 同じ ST で数 SNP しか違わない別分離株は見分けられない (目的は取り違えの検出)。
+- 測れる位置が少ないとき (窓 20 個未満 / 全体の 50% 未満) は「判定できず」で続ける。
+- 判定は `hybrid_assembly.py check` の `judge()` (純関数)。cgSNP の BAM 登録は mlst・species_id に
+  依存しアセンブリ失敗で走らないので、追加の依存は要らなかった。
+
+**kaoki_stec の「同一株ペア」は全部が同一株ではない (重要な副産物)**。ONT と Illumina の組 12 組を
+上の方法で調べたら **7 組が別株**: 別 ST 3 組 (TAS182 / TAS216 / TAS255 = ONT は Salmonella) に加え、
+**MLST が同じ ST11 でも 4 組 (TAS023 / TAS132 / TAS204 / TAS213) が別株**。置換は遷移が多く
+Dam/Dcm モチーフに寄らず、置換位置の長鎖の 97〜98% が別の塩基を支持した (別 ST の TAS182 と同じ型)。
+#37/#38 の「同一株の ONT×Illumina」の扱いを見直すときはこの点を確かめること (未確認)。
+
+**短鎖のみの contig**: 決定: アセンブリには残し、**プラスミド DB には環状でも登録しない**。
+同じ minimap2 の結果で contig ごとに長鎖の被覆 (長さの 80% 以上を 3 本以上) を見て、満たさない contig を
+`short_read_only_contigs` に書く。register_plasmids_to_db は見送り理由 `short_read_only` で withheld に入れ、
+check_plasmid_outbreak は non_circular と同じく**照会だけ**行う (#37.1)。
+
+**入力ファイルの判定の修正 (classify_input, 日常の経路にも効く)**:
+- **Guppy / MinKNOW のチャンク番号 `_1` / `_2` が Illumina の `sample_1` / `sample_2` 規則に当たっていた。**
+  実測 11514: `fastq_runid_<runid>_1.fastq.gz` 等 4 本が長鎖から黙って外れていた。長鎖だけを置くと
+  チャンク同士が Illumina のペアになり hybrid と判定される。`fastq_runid_` / `_pass_` / `_fail_` /
+  `barcode\d+` を含む名前は `_1/_2` の規則に使わない。
+- `_fail_` (Guppy の品質基準に落ちたリード) は使わず `excluded_reads` に記録する。
+- 短鎖と同居する長鎖は名前の手掛かり (`nanopore` 等) が無いと採らない (従来どおり) が、
+  **ハイブリッドを選んだジョブでは手掛かりなしで採る** (実測 11529: `11529.fastq.gz` が採られなかった)。
+
+**入力の種類の表示 (Results の一覧の「入力」列 + 検体詳細)**:
+判定は `workflow/scripts/read_platform.py` だけ (#19)。classify_input が `read_platform` を input_class.json に書き、
+per_sample_report が `input_summary` セクションにする (無い旧検体はその場で判定)。一覧の行は
+`summary_row._input_fields` (`input_*`)。文言は `frontend/src/lib/inputType.ts` (一覧・CSV・詳細が共用)。
+- Illumina の機種はリード名の装置 ID (`M02309` → MiSeq)。SRA から落としたもので元の名前が残っていなければ「Illumina」。
+- ONT のフローセルはヘッダ (Guppy の `model_version_id` / Dorado の `basecall_model_version_id` / `RG:Z:`) →
+  ファイル名 (`r941` / `r1041` / Kit 14 の `RBK114` 等) → 置き場所 (`dorado_samples/` = TAROT の Dorado = R10.4.1)。
+  **このシステムの Dorado が書く fastq はヘッダが `@<uuid>` だけ**なので置き場所で判断している。
+- **Kit 9/10 (RBK004 / LSK109 等) からは決めない** (R9.4.1 と R10.3 の両方に使われた)。`NBD114` も使わない
+  (旧 R9 用の EXP-NBD114 と新 R10 用の SQK-NBD114 が同じ綴り)。分からなければ「ONT (フローセル不明)」。
+- 長鎖のファイル名の手掛かりは**リンクを解決する前の名前**で読む (classify_input は実体のパスを書くので)。
+  実体の名前を変えずにリンク名で種類を伝えられる。
+- Guppy 5 の CRF モデルは幅で精度モードが分かる (96 = fast / 384 = hac / 768 = sup)。
+- 既存検体は `workflow/scripts/backfill_input_summary.py` (dry-run 既定、`--path-map` で Mac から NAS を読める)。
+  **`{sample}_summary.json` も作り直す** (一覧はこちらを読む)。全 1,866 検体の dry-run は 93 秒。
+- Results の表示列は保存済みの利用者にも新しい既定列を一度だけ出す (`tarot-summary-known-cols`)。
+  保存済みの集合をそのまま使うと、後から足した列が永久に隠れる。
+
+**ワーカー**: `unicycler_env` (unicycler 0.5.1 / spades 4.3.0 / racon 1.5.0 / minimap2 2.31 / samtools 1.24 /
+polypolish 0.7.1 / pypolca 0.5.0 / seqkit 2.14.0 / python 3.12) を 3 台に作成済み (2026-10-07)。py39 には入れない。
+**該当ファイル**: `workflow/scripts/read_platform.py` (新規), `workflow/scripts/hybrid_assembly.py` (新規),
+`workflow/scripts/backfill_input_summary.py` (新規), `workflow/scripts/classify_input.py`,
+`workflow/rules/stage1_spades_assembly.smk`, `workflow/rules/stage1_plasmid_db.smk`, `workflow/rules/stage4_aggregate.smk`,
+`workflow/scripts/register_plasmids_to_db.py` (`load_short_read_only`), `workflow/scripts/check_plasmid_outbreak.py`,
+`workflow/scripts/per_sample_report.py` (`_build_input_summary_section`, `_build_hybrid_section`),
+`workflow/scripts/summary_row.py` (`_input_fields`), `workflow/tests/test_hybrid_assembly.py` (新規),
+`config/config.yaml` の `assembly.hybrid`, `api/validators.py`, `api/tests/test_tenant_isolation_inputs.py`,
+`frontend/src/lib/inputType.ts` (新規), `frontend/src/lib/assemblySource.ts`, `frontend/src/pages/Results.tsx`,
+`frontend/src/pages/SampleDetail.tsx`, `frontend/src/pages/NewJob.tsx`, `frontend/src/lib/htmlExport.ts`, locales
