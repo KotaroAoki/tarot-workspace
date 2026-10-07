@@ -5160,6 +5160,12 @@ per_sample_report と register_plasmids_to_db は params で読む。
   **Unicycler の `depth=` は染色体を 1 とした相対値なので名前 (`cov:`) に入れない** (#37 の k-mer 被覆と同じ教訓)。
 - 画面のアセンブラ判定 (`lib/assemblySource.ts`) は `/assembly` の mode だけでは区別できないので、
   レポートの `input_summary.assembler` を見る (`unicycler`)。
+- **実行中のジョブ画面も同じ** (2026-10-08 に利用者が発見: Unicycler が動いているのに
+  タイムラインは「Assembly (SPAdes)」「実行中: SPAdes アセンブリ」と出ていた)。ルール名は
+  `spades_assembly` のままなのでルール名からも決まらない。API が input_class.json の
+  `hybrid_requested` から `sample_assemblers` を作り (`planned_assembler` / `JobRecord.record_input_class`。
+  input_class.json を読む 4 か所はすべてここを通す)、`PipelineTimeline` の `assembler` に渡す。
+  hybrid でアセンブラが分からないとき (旧 API) は「Assembly」とだけ出す (推測で SPAdes と書かない)。
 
 **入力一致の確認 (2 つのリードが同じ株か)** — 決定: 別株なら**検体を止めて DB に登録しない**。
 長鎖を最終アセンブリに minimap2 で並べ、`samtools consensus -c 0.95 -d 10` の多数決とアセンブリが
