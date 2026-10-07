@@ -4932,15 +4932,10 @@ WSL・Windows の再起動 (単発)。**未解決のイベントは DB に残り
   入れていた — `TAROT_DEMO_ACCOUNT_DAYS` は廃止)。期限は `manage_accounts.py set-expiry` で手で入れた
   ときだけ効く。読めない期限の値は「期限なし」ではなく**期限切れ**として扱う。
   **`set-expiry <名前> 0` は「期限なし」** (none と同じ)。すぐ止めたいときは Admin 画面で無効にする。
-- **デモアカウントのアドレスに別のグループから招待が来たら、そのアカウントを招待したグループへ移す**
-  (本利用への移行。2026-10-06 ユーザー決定)。1 アドレス 1 アカウントなので、これが無いとデモで試した
-  候補者を招待できない。判定は `AccountStore.claim_demo_account` だけで、移すのは
-  「そのアドレスのアカウントがちょうど 1 つ・本人が確認済み・デモグループの admin 以外・有効・
-  移動先がデモではない」ときだけ (満たさなければ従来どおり 409)。移したら有効期限を外し、
-  ログイン中のセッションを失効させ (閲覧専用の印が残るため)、本人にメールで知らせ、移動先の
-  招待一覧に使用済みの招待を 1 件残す。招待コードは送らず、申請と承認も挟まない
-  (管理者の承認はデモの参加時に済んでいる)。メールが送れなくても移動は取り消さない。
-  **データは動かない** (デモのデータは移った後は見えない)。
+- ~~デモアカウントのアドレスに別のグループから招待が来たら、そのアカウントを招待したグループへ移す~~
+  (2026-10-06 に入れたが **2026-10-07 にやめた**。デモ (個人・2 段階認証なし) と施設のアカウントを
+  混ぜないため。`claim_demo_account` は削除。今はメールアドレスの重複をデモとそれ以外で別々に数え
+  (`email_in_use(demo=)`)、デモで試した人も施設には新しいアカウントで参加する。#77)
 - デモデータの解析と候補者の招待は、デモグループ所属の **admin** (`demo_curator`、院内 LAN からのみ) が行う。
 - `set-demo-group` は CLI (別プロセス) なので、**ログイン中のセッションには次のログインから**効く。
 - 画面は入口を隠すだけ (`lib/readOnly.ts` の `useReadOnly()`、`components/DemoBanner.tsx`)。
@@ -5013,8 +5008,8 @@ NAS をどれだけ使っているか」を見られるようにする。
 **背景 (2026-10-07)**: 株式会社TAR が有償で提供するにあたり、ロゴ (墨色の線画アイコン 8 個 +
 細い文字のロゴタイプ) を基調に見た目を揃え、`/` にランディングページ (LP) を置く。
 デモ (個人・閲覧専用・即時) → トライアル (施設単位・60 日・24 クレジット) → 本契約 の流れを
-LP から始められるようにする。**今回入ったのは段階 1 (ブランド)・2 (LP)・4 (施設の分離)**。
-段階 3 (デモの即時開始) と 5・6 (トライアル・本契約) は未着手。
+LP から始められるようにする。**入ったのは段階 1 (ブランド)・2 (LP)・4 (施設の分離)・3 (デモの即時開始。
+この節の末尾)**。5・6 (トライアル・本契約) は未着手。
 
 **ブランド**:
 - ロゴの元データは Canva の書き出し (`ロゴ/08_TAROT-Analyzer/TAROT-Analyzerロゴ.svg`)。
@@ -5055,23 +5050,19 @@ LP から始められるようにする。**今回入ったのは段階 1 (ブ�
    `bam_cache/t_{グループ}-{ハッシュ}/{菌種}/{群}/` に分けた。施設を渡されなければキャッシュを
    使わない。旧版の置き場所は 6 時間更新が無ければ消す (デプロイ直後に旧版の処理が読んでいる
    途中のものを消さないため)。
-2. **施設由来の参照ゲノム (#31) が全グループ共有の置き場所にあった**。別の施設が同じ菌種・ST を
-   解析するとその参照に当たり、**参照のファイル名に入っている元の検体名が結果に出る**。
-   グループ専用の置き場所 `{グループのルート}/db/references` を作り、**bam_db の隣から導く**
-   (`isolation_dates.json` と同じ作り。API・ルール・config の変更なし)。探す順は
-   **グループの ST → 共有の ST → グループの STany → 共有の STany** で、`core_snp_reference.py`
-   だけが決める (BAM 作成と系統解析が同じ関数を通る)。参照の同一性は
-   (ST のディレクトリ名, ファイル名) で比べるので、置き場所を移しても既存の BAM は無効にならない。
-   - `promote_inhouse_reference.py` はグループ専用の置き場所にしか置かない
-     (共有は `--allow-shared`、別グループは拒否)。
-   - **既存の 4 本の移動は未実行**。`tools/scope_inhouse_references.py` (確認だけが既定)。
-     **新しい版の workflow を本番に反映してから実行すること** — 旧版は共有の置き場所しか
-     見ないので、先に移すと元の施設の cgSNP も「参照なし」になる。
-   - **実測 (2026-10-07): 施設をまたいだ利用が既に起きていた。** toho_micro_id_bsi 由来の
-     Cfreundii ST581 は toho_micro_id (1 本)、Eludwigii ST15 は toho_micro_id と kojima
-     (各 1 本) でも BAM の作成に使われていた。tmuh 由来の 2 本 (Enterococcus ST2822 / ST2158) は
-     tmuh だけ。他グループが使っている参照は既定で止まり、`--force` (元のグループへだけ移す) か
-     `--copy-to-users` (使っているグループにも複製。**互いに見えてよいグループの場合だけ**) を選ぶ。
+2. **施設由来の参照ゲノム (#31) は共有の置き場所のままでよい** (2026-10-07 ユーザー決定:
+   施設の検体から作った参照は、他のグループから見えてよい)。一度はグループ専用へ移す前提で
+   移動のツールまで作ったが、決定を受けて削除した。残したのは次の 2 つだけ:
+   - 参照の探す順 = **グループの ST → 共有の ST → グループの STany → 共有の STany**
+     (`core_snp_reference.py` だけが決め、BAM 作成と系統解析が同じ関数を通る)。グループ専用の
+     置き場所 `{グループのルート}/db/references` は **bam_db の隣から導く** (API・ルール・config の
+     変更なし)。何も置かなければ従来どおり共有の置き場所だけを見る。
+   - `promote_inhouse_reference.py` は共有の置き場所が既定。グループ専用にも置けるが、
+     **元の検体と同じグループに限る** (`destination_problem`)。
+   - 参照の同一性は (ST のディレクトリ名, ファイル名) で比べるので、置き場所を変えても既存の
+     BAM は無効にならない。
+   - 実測 (2026-10-07): toho_micro_id_bsi 由来の Cfreundii ST581 は toho_micro_id、Eludwigii ST15 は
+     toho_micro_id と kojima でも使われていた (決定により問題なし)。
 
 **検証のしかた (ログイン後の画面)**: Mac の API は起動しない (二重ディスパッチ)。
 `/api/auth/me` だけに 200 を返す仮 API (ジョブを扱わない) を 8000 番で立て、sessionStorage に
@@ -5086,6 +5077,35 @@ LP から始められるようにする。**今回入ったのは段階 1 (ブ�
 `deploy/tarot.env.example`, `workflow/scripts/run_core_snp_phylo.py` (`bam_cache_tenant`,
 `localize_bams(tenant=)`, `get_reference_for(bam_db=)`), `workflow/scripts/run_core_snp_map.py`
 (`find_reference(bam_db=)`), `workflow/scripts/core_snp_reference.py` (新規),
-`tools/promote_inhouse_reference.py` (`destination_problem`), `tools/scope_inhouse_references.py` (新規),
+`tools/promote_inhouse_reference.py` (`destination_problem`),
 `tools/import_assembly_bams.py`, `workflow/tests/test_bam_cache_isolation.py` /
 `test_core_snp_reference.py` (新規)
+
+**段階 3 = デモの即時開始 (2026-10-07 実装・既定 off)**:
+- ランディングページの「デモを始める」(`/login?signup=demo`) → 所属・利用条件への同意・確認コード →
+  **承認なしでデモグループの有効なアカウント** (`request_kind = demo`)。入れ先はサーバーが決める
+  (`TAROT_DEMO_GROUP_ID`、空ならデモグループがちょうど 1 つのときだけ)。利用者はグループを選べない。
+- **`TAROT_DEMO_SELF_SIGNUP=true` にするまで受け付けない** (デモデータを誰でも見られる状態にしてよいかの
+  施設の了承が前提)。メールを送れないサーバーでも受け付けない。確認の途中で off にしたら作らない。
+- **閲覧専用のデモのセッションは 2 段階認証を求めない** (`demo_mode.mfa_exempt`)。公開モードの守りを
+  個別に緩めない方針 (#62) の唯一の例外で、条件はこの 1 か所。施設のアカウントとデモグループの admin は従来どおり。
+- **デモのセッションは同時に使える数に上限** (`TAROT_DEMO_MAX_SESSIONS`、既定 30) を付け、アイドルの
+  期限を短くした (`TAROT_DEMO_SESSION_IDLE_MINUTES`、既定 30)。**通常のセッションは期限が切れても
+  SessionInfo と SSH 接続を消さない** (ジョブが token を参照する #36.2) ので、誰でも作れるアカウントだと
+  ワーカーへの SSH 接続が溜まる。デモのセッションはジョブを持たないので、次のデモのログインのときに
+  期限切れのものを閉じる (`ssh_manager.reap_idle_read_only`)。上限を超えたら 503 「混み合っています」。
+  `/api/auth/me` は表示用でアイドルの期限を見ない (既存の全セッションと同じ)。
+- 登録の通知は承認待ちの通知と分け、**1 日 1 通にまとめる** (`DemoSignupNotifier`)。本人には見どころの
+  巡回順とトライアルの申込先を書いた案内を送る (`account_mail.demo_welcome`)。
+- デモのバナーに「自施設のデータで試す」(`/login?switch=1&signup=trial`、別ウィンドウ) を足した。
+- **画面の確認で踏んだもの**: 自動操作の `form_input` でチェックボックスを入れても React の onChange が
+  走らず、ボタンが押せないままになる。本物のクリックなら動く (アプリの不具合ではない)。
+**該当ファイル (段階 3)**: `api/demo_mode.py` (`self_signup_enabled`, `resolve_demo_group`, `mfa_exempt`,
+`max_sessions`, `session_idle_s`), `api/routers/auth.py` (`_demo_signup`, `_finish_demo_signup`,
+`_demo_signup_available`, ログインの 2 段階認証の判定, `_account_login` の上限, `require_session` の
+アイドル期限), `api/services/account_store.py` (`email_in_use(demo=)`, `create_demo_account`,
+`claim_demo_account` 削除), `api/routers/account_self.py`, `api/services/ssh_manager.py`
+(`live_read_only_sessions`, `reap_idle_read_only`), `api/services/signup_notify.py` (`DemoSignupNotifier`),
+`api/services/account_mail.py` (`demo_welcome`), `api/models/schemas.py`, `deploy/tarot.env.example`,
+`api/tests/test_demo_self_signup.py` (新規), `api/tests/test_signup_invitations.py`,
+`frontend/src/pages/Login.tsx`, `frontend/src/lib/auth.tsx`, `frontend/src/components/DemoBanner.tsx`, locales
